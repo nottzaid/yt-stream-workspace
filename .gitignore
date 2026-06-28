@@ -1,0 +1,6 @@
+*.log
+*.flv
+*.mp4
+*.mkv
+state
+.DS_Store

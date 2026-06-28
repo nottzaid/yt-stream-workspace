@@ -1,0 +1,32 @@
+# yt-stream-workspace user configuration.
+# Copy to ~/.config/yt-stream-workspace/config and edit if needed.
+
+# Name of the Hyprland headless output used as the captured stream output.
+YTWS_OUTPUT=YT-STREAM
+
+# Virtual output mode. Defaults are chosen for YouTube 1080p60.
+YTWS_WIDTH=1920
+YTWS_HEIGHT=1080
+YTWS_FPS=60
+YTWS_SCALE=1.5
+
+# Hardware encoder. Leave empty for auto-detection. On Intel laptops this is
+# usually /dev/dri/renderD128. NVIDIA MX110/MX130-class GPUs do not provide
+# NVENC, so they are not useful for H.264 offload here.
+# YTWS_VAAPI_DEVICE=/dev/dri/renderD128
+
+# wf-recorder / VAAPI bitrate settings.
+YTWS_VIDEO_BITRATE=12M
+YTWS_VIDEO_MAXRATE=12M
+YTWS_VIDEO_BUFSIZE=24M
+YTWS_VIDEO_GOP=120
+YTWS_AUDIO_BITRATE=128k
+
+# Local RTMP validation port used by `workspace-stream test`.
+YTWS_TEST_RTMP_PORT=19350
+
+# YouTube RTMPS ingest base URL. The stream key is prompted interactively.
+YTWS_YOUTUBE_RTMPS_URL=rtmps://a.rtmps.youtube.com/live2
+
+# Optional wallpaper on the virtual output, if swaybg is installed.
+YTWS_WALLPAPER="$HOME/Pictures/background.png"
