@@ -33,9 +33,11 @@ YTWS_AUDIO_BITRATE=128k
 YTWS_DESKTOP_AUDIO=default
 YTWS_MIC=default
 
-# The recorder. Empty uses the patched build from native/build.sh when it is
-# installed, else wf-recorder from PATH.
+# The recorder and the preview client. Empty uses the builds from
+# native/build.sh when they are installed, else wf-recorder and wl-mirror from
+# PATH. The YTWS_MIRROR_BACKEND setting above applies only to wl-mirror.
 # YTWS_RECORDER=
+# YTWS_PREVIEW=
 
 # Local RTMP validation port used by `workspace-stream test`.
 YTWS_TEST_RTMP_PORT=19350

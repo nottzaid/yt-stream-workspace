@@ -46,10 +46,11 @@ MIX_SINK="${YTWS_MIX_SINK:-yt_stream_mix}"
 # followed when either changes. "none" leaves one out; a node name pins one.
 DESKTOP_AUDIO="${YTWS_DESKTOP_AUDIO:-default}"
 MIC="${YTWS_MIC:-default}"
-# The patched recorder built by native/build.sh, used when present;
-# otherwise wf-recorder from PATH.
+# Helpers built by native/build.sh, used when present: the patched recorder
+# and the copy-free preview. Otherwise wf-recorder and wl-mirror from PATH.
 NATIVE_BIN="${XDG_DATA_HOME:-$HOME/.local/share}/yt-stream-workspace/bin"
 CONFIGURED_RECORDER="${YTWS_RECORDER:-}"
+CONFIGURED_PREVIEW="${YTWS_PREVIEW:-}"
 RUN_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/yt-stream-workspace"
 STATE_FILE="$RUN_DIR/state"
 SESSION_FILE="$RUN_DIR/session.lua"
@@ -340,6 +341,7 @@ write_state() {
         printf 'MIC=%q\n' "$MIC"
         printf 'RECORDER=%q\n' "${RECORDER:-}"
         printf 'RECORDER_PATCHED=%q\n' "${RECORDER_PATCHED:-0}"
+        printf 'PREVIEW_COMMAND=%q\n' "${PREVIEW_COMMAND:-}"
         printf 'MIRROR_BACKEND=%q\n' "$MIRROR_BACKEND"
         printf 'WALLPAPER=%q\n' "$WALLPAPER"
         printf 'NOTIFY=%q\n' "$NOTIFY"
@@ -550,6 +552,21 @@ resolve_recorder() {
     fi
 }
 
+# Which preview client to run: ytws-preview from native/build.sh, which hands
+# captured frames to Hyprland without copying them and is idle while hidden or
+# while the stream does not change, else wl-mirror.
+resolve_preview() {
+    PREVIEW_COMMAND="$CONFIGURED_PREVIEW"
+    if [[ -z "$PREVIEW_COMMAND" && -x "$NATIVE_BIN/ytws-preview" ]]; then
+        PREVIEW_COMMAND="$NATIVE_BIN/ytws-preview"
+    fi
+    if [[ "${PREVIEW_COMMAND:-wl-mirror}" != */* ]]; then
+        PREVIEW_COMMAND="$(command -v "${PREVIEW_COMMAND:-wl-mirror}")" ||
+            die "no preview client: install wl-mirror, or build ytws-preview with native/build.sh"
+    fi
+    [[ -x "$PREVIEW_COMMAND" ]] || die "YTWS_PREVIEW is not an executable: $PREVIEW_COMMAND"
+}
+
 wf_recorder_args() {
     : "${VAAPI_DEVICE:?VAAPI_DEVICE is not set}"
     WF_ARGS=(-o "$OUTPUT")
@@ -668,7 +685,7 @@ stop_supervisor() {
     # Whatever a supervisor that died left behind.
     load_status
     stop_pid "$LIVE_PID" wf-recorder
-    stop_pid "$MIRROR_PID" wl-mirror
+    stop_pid "$MIRROR_PID" "$(preview_name)"
     stop_pid "$WALLPAPER_PID" swaybg
     stop_pid "$AUDIO_WATCH_PID" pactl
     # Sessions started before the supervisor recorded helpers in the state.
@@ -689,8 +706,9 @@ abort_start() {
 
 start_session() {
     validate_config
-    require_commands hyprctl jq pactl pw-link wl-mirror ffmpeg ss setsid
+    require_commands hyprctl jq pactl pw-link ffmpeg ss setsid
     resolve_recorder
+    resolve_preview
     discard_stale_session
     ensure_module
     output_exists && die "Hyprland output '$OUTPUT' already exists"
@@ -864,9 +882,19 @@ socket_acked() {
     return "$_sa_found"
 }
 
+# The executable name of the session's preview client.
+preview_name() {
+    local command="${PREVIEW_COMMAND:-wl-mirror}"
+    printf '%s' "${command##*/}"
+}
+
 sup_mirror_start() {
-    wl-mirror --backend "$MIRROR_BACKEND" --show-cursor --scaling fit \
-        --title "$PREVIEW_TITLE" "$OUTPUT" </dev/null >>"$LOG_DIR/wl-mirror.log" 2>&1 &
+    if [[ "$(preview_name)" == wl-mirror ]]; then
+        "${PREVIEW_COMMAND:-wl-mirror}" --backend "$MIRROR_BACKEND" --show-cursor --scaling fit \
+            --title "$PREVIEW_TITLE" "$OUTPUT" </dev/null >>"$LOG_DIR/preview.log" 2>&1 &
+    else
+        "$PREVIEW_COMMAND" --title "$PREVIEW_TITLE" "$OUTPUT" </dev/null >>"$LOG_DIR/preview.log" 2>&1 &
+    fi
     MIRROR_PID=$!
     MIRROR_STATE=up
     sup_log "preview started (pid $MIRROR_PID)"
@@ -887,7 +915,7 @@ sup_mirror_check() {
         MIRROR_STATE=failed
         MIRROR_PID=""
         notify_user -u critical "Stream preview keeps failing" \
-            "The stream itself is unaffected. See $LOG_DIR/wl-mirror.log."
+            "The stream itself is unaffected. See $LOG_DIR/preview.log."
         return 0
     fi
     MIRROR_RESTARTS=$((MIRROR_RESTARTS + 1))
@@ -1530,9 +1558,20 @@ run_doctor() {
     printf 'logs: %s\n' "$LOG_DIR"
 
     local command
-    for command in hyprctl jq pactl pw-link wl-mirror ffmpeg ffprobe ss setsid getent; do
+    for command in hyprctl jq pactl pw-link ffmpeg ffprobe ss setsid getent; do
         doctor_check_command "$command"
     done
+    local preview
+    if preview="$(resolve_preview 2>/dev/null && printf '%s' "$PREVIEW_COMMAND")"; then
+        if [[ "${preview##*/}" == wl-mirror ]]; then
+            printf 'warn preview: %s redraws the whole preview every frame while shown; native/build.sh builds ytws-preview, which does not\n' "$preview"
+        else
+            printf 'ok   preview: %s\n' "$preview"
+        fi
+    else
+        printf 'miss preview: neither ytws-preview nor wl-mirror is installed; native/build.sh builds ytws-preview\n'
+        DOCTOR_FAILED=1
+    fi
     local recorder
     if recorder="$(resolve_recorder 2>/dev/null && printf '%s %s' "$RECORDER_PATCHED" "$RECORDER")"; then
         if [[ "${recorder%% *}" == 1 ]]; then

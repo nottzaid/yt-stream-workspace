@@ -27,7 +27,9 @@ jobs:
           pacman -Syu --noconfirm --needed git base-devel meson ninja pkgconf
           wayland wayland-protocols mesa libdrm ffmpeg pipewire libpulse
       - uses: actions/checkout@v7
-      - name: Build the patched wf-recorder
+      - name: Build the patched wf-recorder and ytws-preview
         run: native/build.sh "$RUNNER_TEMP/native"
-      - name: Check the build
-        run: '"$RUNNER_TEMP/native/wf-recorder" --help | grep -q -- --cfr'
+      - name: Check the builds
+        run: |
+          "$RUNNER_TEMP/native/wf-recorder" --help | grep -q -- --cfr
+          { "$RUNNER_TEMP/native/ytws-preview" 2>&1 || true; } | grep -q usage

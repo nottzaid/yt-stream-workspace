@@ -29,9 +29,13 @@
 local PROTOCOL = 1
 local PREVIEW_NAME = "stream-preview"
 local CURTAIN_NAME = "stream-curtain"
-local PREVIEW_CLASS = "at.yrlf.wl_mirror"
+-- The preview client: ytws-preview when built, else wl-mirror.
+local PREVIEW_CLASSES = { ["yt-stream-workspace.preview"] = true, ["at.yrlf.wl_mirror"] = true }
 local PREVIEW_TITLE = "yt-stream-workspace preview"
-local PREVIEW_MATCH = { class = "^at\\.yrlf\\.wl_mirror$", title = "^yt-stream-workspace preview$" }
+local PREVIEW_MATCH = {
+    class = "^(yt-stream-workspace\\.preview|at\\.yrlf\\.wl_mirror)$",
+    title = "^yt-stream-workspace preview$",
+}
 local OUTPUT_GAP = 256 -- logical px between the physical layout and the output
 local CURSOR_SAMPLE_MS = 250
 
@@ -281,7 +285,7 @@ local function clamp_into(box, x, y)
     return math.max(box.x, math.min(box.x + box.w - 1, x)), math.max(box.y, math.min(box.y + box.h - 1, y))
 end
 
--- wl-mirror shows the output scaled to fit the preview monitor, centred.
+-- The preview shows the output scaled to fit the preview monitor, centred.
 local function fit(view, source)
     local s = math.min(view.w / source.w, view.h / source.h)
     return s, view.x + (view.w - source.w * s) / 2, view.y + (view.h - source.h * s) / 2
@@ -1239,7 +1243,7 @@ function M.status()
     end
     local preview = {}
     for _, w in ipairs(hl.get_windows()) do
-        if w.class == PREVIEW_CLASS and w.title == PREVIEW_TITLE then
+        if PREVIEW_CLASSES[w.class] and w.title == PREVIEW_TITLE then
             preview[#preview + 1] = { address = w.address, pid = w.pid, workspace = w.workspace and w.workspace.name }
         end
     end

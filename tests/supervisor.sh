@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Drive the session supervisor against fake wl-mirror, wf-recorder, pactl
+# Drive the session supervisor against fake ytws-preview, wf-recorder, pactl
 # and pw-link binaries: connect, report bitrate, keep the key out of the log,
 # feed the mix only while live and follow the default devices, recover a
 # stalled connection, give up on a refused key, restart a crashed preview,
@@ -88,8 +88,9 @@ slowstop)
     ;;
 esac
 EOF
-cat >"$FAKE/bin/wl-mirror" <<'EOF'
+cat >"$FAKE/bin/ytws-preview" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >"$FAKE_DIR/preview.args"
 exec {nap}<> <(:)
 while :; do read -r -t 1 -u "$nap" _ || true; done
 EOF
@@ -154,6 +155,7 @@ VIDEO_GOP=120
 AUDIO_BITRATE=128k
 YOUTUBE_RTMPS_URL=rtmps://ingest.invalid/live2
 MIX_SINK=yt_stream_mix
+PREVIEW_COMMAND=$FAKE/bin/ytws-preview
 MIRROR_BACKEND=auto
 WALLPAPER=/nonexistent
 NOTIFY=1
@@ -212,6 +214,8 @@ SUP=$!
 wait_for "the supervisor to start" 5 test -p "$RUN/control"
 wait_for "the preview" 5 is_state offline
 [[ "$(status_value MIRROR_STATE)" == up ]] || fail "preview not reported up"
+[[ "$(<"$FAKE/preview.args")" == "--title yt-stream-workspace preview YT-STREAM" ]] ||
+    fail "preview started as: $(<"$FAKE/preview.args")"
 
 # Going live: connecting, then live with a measured bitrate.
 send "1 live $KEY"
@@ -304,7 +308,7 @@ wait "$SUP" 2>/dev/null || true
 SUP=""
 [[ ! -e "$RUN/control" ]] || fail "control FIFO left behind"
 ! kill -0 "$live_pid" 2>/dev/null || fail "wf-recorder survived the supervisor"
-! kill -0 "$mirror" 2>/dev/null || fail "wl-mirror survived the supervisor"
+! kill -0 "$mirror" 2>/dev/null || fail "the preview survived the supervisor"
 ! kill -0 "$(<"$FAKE/subscribe.pid")" 2>/dev/null || fail "the device watcher survived the supervisor"
 [[ ! -s "$FAKE/links" ]] || fail "audio links left after shutdown: $(cat "$FAKE/links")"
 is_state offline || fail "final status not offline"

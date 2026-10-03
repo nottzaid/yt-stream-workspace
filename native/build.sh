@@ -2,6 +2,7 @@
 # Build the native helpers and install them where workspace-stream looks for
 # them first:
 #   wf-recorder   upstream at a pinned commit, with the patches in wf-recorder/
+#   ytws-preview  the copy-free preview client in preview/
 #
 # Usage: native/build.sh [DIRECTORY]
 #   DIRECTORY defaults to ${XDG_DATA_HOME:-~/.local/share}/yt-stream-workspace/bin
@@ -45,7 +46,11 @@ build wf-recorder "$WORK/wf-recorder-src" -Dpipewire=enabled -Ddefault_audio_bac
 [[ "$("$WORK/wf-recorder/wf-recorder" --help 2>&1)" == *--cfr* ]] ||
     die "the built wf-recorder lacks the patches"
 
+build ytws-preview "$HERE/preview"
+
 mkdir -p "$DEST"
-install -m 755 -s "$WORK/wf-recorder/wf-recorder" "$DEST/.wf-recorder.new"
-mv -f "$DEST/.wf-recorder.new" "$DEST/wf-recorder"
-printf 'installed %s\n' "$DEST/wf-recorder"
+for binary in wf-recorder/wf-recorder ytws-preview/ytws-preview; do
+    install -m 755 -s "$WORK/$binary" "$DEST/.${binary##*/}.new"
+    mv -f "$DEST/.${binary##*/}.new" "$DEST/${binary##*/}"
+    printf 'installed %s\n' "$DEST/${binary##*/}"
+done
