@@ -1469,6 +1469,11 @@ focused_monitor() {
     hypr_call 'return hl.get_active_monitor().name'
 }
 
+# Where every window is: address, workspace, fullscreen, hidden.
+window_placement() {
+    hyprctl -j clients | jq -r '.[] | "\(.address) \(.workspace.name) \(.fullscreen) \(.hidden) \(.class)"' | sort
+}
+
 run_self_test() {
     validate_config
     require_commands hyprctl jq kitty wtype ffmpeg ffprobe setsid
@@ -1478,8 +1483,10 @@ run_self_test() {
     local test_workspace="${YTWS_SELF_TEST_WORKSPACE:-99}"
     local marker="$RUN_DIR.self-test-$$"
     local test_pid=""
-    local original_workspace
+    local original_workspace before
     original_workspace="$(hypr_call 'return hl.get_active_workspace().id')"
+    # The test must leave your own windows exactly where they were.
+    before="$(window_placement)"
 
     cleanup_self_test() {
         if [[ -r "$STATE_FILE" ]]; then
@@ -1528,9 +1535,17 @@ run_self_test() {
     note "input return to $PREVIEW_ON passed"
 
     "$SELF" test 5
-    note "all automated integration checks passed"
     cleanup_self_test
     trap - EXIT
+    local after moved
+    after="$(window_placement)"
+    moved="$(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after"))"
+    if [[ -n "$moved" ]]; then
+        printf 'workspace-stream: before the test:  %s\n' "$moved" >&2
+        die "the self-test moved or changed windows it did not create"
+    fi
+    note "your own windows were left where they were"
+    note "all automated integration checks passed"
 }
 
 case "${1:-}" in
