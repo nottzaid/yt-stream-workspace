@@ -26,6 +26,13 @@ YTWS_VIDEO_BUFSIZE=24M
 YTWS_VIDEO_GOP=120
 YTWS_AUDIO_BITRATE=128k
 
+# What viewers hear while you are live: "default" follows the default output
+# device (everything your speakers play) and the default microphone, "none"
+# leaves one out, a PipeWire node name pins a device. Nothing is captured,
+# and the microphone stays closed, while nothing is recorded.
+YTWS_DESKTOP_AUDIO=default
+YTWS_MIC=default
+
 # Local RTMP validation port used by `workspace-stream test`.
 YTWS_TEST_RTMP_PORT=19350
 
