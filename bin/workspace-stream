@@ -46,6 +46,10 @@ MIX_SINK="${YTWS_MIX_SINK:-yt_stream_mix}"
 # followed when either changes. "none" leaves one out; a node name pins one.
 DESKTOP_AUDIO="${YTWS_DESKTOP_AUDIO:-default}"
 MIC="${YTWS_MIC:-default}"
+# The patched recorder built by native/build.sh, used when present;
+# otherwise wf-recorder from PATH.
+NATIVE_BIN="${XDG_DATA_HOME:-$HOME/.local/share}/yt-stream-workspace/bin"
+CONFIGURED_RECORDER="${YTWS_RECORDER:-}"
 RUN_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/yt-stream-workspace"
 STATE_FILE="$RUN_DIR/state"
 SESSION_FILE="$RUN_DIR/session.lua"
@@ -334,6 +338,8 @@ write_state() {
         printf 'MIX_SINK=%q\n' "$MIX_SINK"
         printf 'DESKTOP_AUDIO=%q\n' "$DESKTOP_AUDIO"
         printf 'MIC=%q\n' "$MIC"
+        printf 'RECORDER=%q\n' "${RECORDER:-}"
+        printf 'RECORDER_PATCHED=%q\n' "${RECORDER_PATCHED:-0}"
         printf 'MIRROR_BACKEND=%q\n' "$MIRROR_BACKEND"
         printf 'WALLPAPER=%q\n' "$WALLPAPER"
         printf 'NOTIFY=%q\n' "$NOTIFY"
@@ -525,11 +531,38 @@ audio_unlink_all() {
     AUDIO_LINKS=()
 }
 
+# --- recorder ---------------------------------------------------------------
+
+# Which wf-recorder to run, and whether it carries recorder/patches.
+resolve_recorder() {
+    RECORDER="$CONFIGURED_RECORDER"
+    if [[ -z "$RECORDER" && -x "$NATIVE_BIN/wf-recorder" ]]; then
+        RECORDER="$NATIVE_BIN/wf-recorder"
+    fi
+    if [[ "${RECORDER:-wf-recorder}" != */* ]]; then
+        RECORDER="$(command -v "${RECORDER:-wf-recorder}")" ||
+            die "wf-recorder is not installed; native/build.sh builds the patched one"
+    fi
+    [[ -x "$RECORDER" ]] || die "YTWS_RECORDER is not an executable: $RECORDER"
+    RECORDER_PATCHED=0
+    if [[ "$("$RECORDER" --help 2>&1)" == *--cfr* ]]; then
+        RECORDER_PATCHED=1
+    fi
+}
+
 wf_recorder_args() {
     : "${VAAPI_DEVICE:?VAAPI_DEVICE is not set}"
-    WF_ARGS=(
-        -o "$OUTPUT"
-        --no-damage
+    WF_ARGS=(-o "$OUTPUT")
+    if [[ "${RECORDER_PATCHED:-0}" == 1 ]]; then
+        # Captures only when the stream changes and repeats the last frame to
+        # keep the rate constant; the audio is the mix node and nothing else.
+        WF_ARGS+=(--cfr --audio-backend=pipewire "--audio=$MIX_SINK")
+    else
+        # Stock wf-recorder gets a constant rate only by making Hyprland
+        # redraw the output for every frame.
+        WF_ARGS+=(--no-damage "--audio=$MIX_SINK.monitor")
+    fi
+    WF_ARGS+=(
         -r "$FPS"
         -c h264_vaapi
         -d "$VAAPI_DEVICE"
@@ -540,7 +573,6 @@ wf_recorder_args() {
         -p "g=$VIDEO_GOP"
         -p profile=high
         -b 2
-        "--audio=$MIX_SINK.monitor"
         -C aac
         -P "b=$AUDIO_BITRATE"
         -R 48000
@@ -657,7 +689,8 @@ abort_start() {
 
 start_session() {
     validate_config
-    require_commands hyprctl jq pactl pw-link wl-mirror wf-recorder ffmpeg ss setsid
+    require_commands hyprctl jq pactl pw-link wl-mirror ffmpeg ss setsid
+    resolve_recorder
     discard_stale_session
     ensure_module
     output_exists && die "Hyprland output '$OUTPUT' already exists"
@@ -871,7 +904,7 @@ sup_redact() {
 
 sup_live_attempt() {
     wf_recorder_args
-    wf-recorder "${WF_ARGS[@]}" -f "${YOUTUBE_RTMPS_URL%/}/$SUP_KEY" </dev/null \
+    "${RECORDER:-wf-recorder}" "${WF_ARGS[@]}" -f "${YOUTUBE_RTMPS_URL%/}/$SUP_KEY" </dev/null \
         > >(sup_redact >>"$LOG_DIR/live.log") 2>&1 &
     LIVE_PID=$!
     LIVE_ATTEMPT_AT=$EPOCHSECONDS
@@ -1216,7 +1249,7 @@ run_local_rtmp_test() {
     validate_config
     load_state
     load_status
-    require_commands ffmpeg ffprobe pw-link
+    require_commands ffmpeg ffprobe pw-link pw-play
     case "${LIVE_STATE:-offline}" in
     offline|failed) ;;
     *) die "YouTube delivery is $LIVE_STATE; stop it before a local test" ;;
@@ -1244,10 +1277,13 @@ run_local_rtmp_test() {
     receiver_pid=$!
     wait_until "local RTMP receiver" port_is_listening "$TEST_RTMP_PORT"
 
+    # A tone straight into the mix, through PipeWire itself as the recorder
+    # reads it: the test then costs what a live stream costs.
+    local tone="$RUN_DIR/test-tone.wav"
     ffmpeg -hide_banner -loglevel error -f lavfi \
         -i "sine=frequency=880:sample_rate=48000:duration=$seconds" \
-        -af volume=0.08 -f pulse -device "$MIX_SINK" \
-        yt-stream-workspace-test-tone >/dev/null 2>&1 &
+        -af volume=0.08 -ac 2 -y "$tone" || die "could not generate the test tone"
+    pw-play --target "$MIX_SINK" "$tone" >/dev/null 2>&1 &
     tone_pid=$!
 
     audio_link_sync
@@ -1255,7 +1291,7 @@ run_local_rtmp_test() {
     note "stream audio: $AUDIO_DESCRIPTION"
 
     wf_recorder_args
-    wf-recorder "${WF_ARGS[@]}" -f "$url" >"$sender_log" 2>&1 &
+    "${RECORDER:-wf-recorder}" "${WF_ARGS[@]}" -f "$url" >"$sender_log" 2>&1 &
     sender_pid=$!
     sleep 1
     unmute_capture "$sender_pid" || true
@@ -1268,6 +1304,7 @@ run_local_rtmp_test() {
         die "wf-recorder failed; see $sender_log"
     }
     wait "$tone_pid" 2>/dev/null || true
+    rm -f "$tone"
     audio_unlink_all
     trap - EXIT
 
@@ -1400,7 +1437,8 @@ show_status() {
             --arg kbps "${LIVE_KBPS:-0}" --arg reconnects "${LIVE_RECONNECTS:-0}" \
             --arg error "${LIVE_ERROR:-}" --arg preview "${MIRROR_STATE:-}" \
             --arg desktop "${DESKTOP_AUDIO:-default}" --arg mic "${MIC:-default}" \
-            --arg linked "${AUDIO_DESCRIPTION:-}" '
+            --arg linked "${AUDIO_DESCRIPTION:-}" \
+            --arg recorder "${RECORDER:-wf-recorder}" --argjson patched "$([[ "${RECORDER_PATCHED:-0}" == 1 ]] && echo true || echo false)" '
             {session: true, workspace: ($workspace | tonumber), output: $output,
              supervisor: $supervisor, preview: $preview,
              live: {state: $live, since: ($since | if . == "" then null else tonumber end),
@@ -1408,6 +1446,7 @@ show_status() {
                     error: (if $error == "" then null else $error end)},
              audio: {desktop: $desktop, microphone: $mic,
                      linked: (if $linked == "" then null else $linked end)},
+             recorder: {path: $recorder, patched: $patched},
              guard: $guard}'
         return
     fi
@@ -1439,6 +1478,12 @@ show_status() {
     printf 'preview:        %s\n' "$preview"
     printf 'supervisor:     %s\n' "$([[ "$supervisor" == true ]] && echo running || echo "not running; run 'workspace-stream stop'")"
     printf 'VAAPI device:   %s\n' "${VAAPI_DEVICE:-unknown}"
+    if [[ "${RECORDER_PATCHED:-0}" == 1 ]]; then
+        printf 'recorder:       %s (patched)\n' "$RECORDER"
+    else
+        printf 'recorder:       %s (stock: Hyprland redraws the stream for every frame)\n' \
+            "${RECORDER:-wf-recorder}"
+    fi
     printf 'logs:           %s\n' "$LOG_DIR"
 }
 
@@ -1485,9 +1530,21 @@ run_doctor() {
     printf 'logs: %s\n' "$LOG_DIR"
 
     local command
-    for command in hyprctl jq pactl pw-link wl-mirror wf-recorder ffmpeg ffprobe ss setsid getent; do
+    for command in hyprctl jq pactl pw-link wl-mirror ffmpeg ffprobe ss setsid getent; do
         doctor_check_command "$command"
     done
+    local recorder
+    if recorder="$(resolve_recorder 2>/dev/null && printf '%s %s' "$RECORDER_PATCHED" "$RECORDER")"; then
+        if [[ "${recorder%% *}" == 1 ]]; then
+            printf 'ok   recorder: %s (patched)\n' "${recorder#* }"
+        else
+            printf 'warn recorder: %s is stock wf-recorder, which makes Hyprland redraw the stream for every frame; native/build.sh builds the patched one\n' \
+                "${recorder#* }"
+        fi
+    else
+        printf 'miss recorder: wf-recorder is not installed; native/build.sh builds it\n'
+        DOCTOR_FAILED=1
+    fi
     doctor_check_optional_command swaybg "only needed for virtual-output wallpaper"
     doctor_check_optional_command notify-send "desktop notifications about live delivery"
     doctor_check_optional_command kitty "needed by self-test"

@@ -1,0 +1,466 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kant <283011337+muradkant@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 19:59:20 +0300
+Subject: [PATCH 5/7] Add --cfr: constant frame rate without forced redraws
+
+Live streaming needs a constant frame rate. --no-damage provides one by
+asking for every frame with a plain copy, which makes the compositor
+redraw the whole output each time, at the full frame rate, even when
+nothing on it has changed.
+
+--cfr keeps damage-driven capture and moves the constant rate into the
+encoder thread: frames are placed on a real-time grid of slots at -r,
+anchored on the first frame, each going to the slot nearest to when it
+was rendered. When a slot's window passes without a new frame, the last
+converted frame is encoded again, so a still screen costs one encode
+per slot and no rendering or conversion at all. Short gaps are filled,
+long stalls are skipped, so the output never runs ahead of real time.
+Timestamps stay in microseconds and the encoder is given the frame rate
+for rate control.
+---
+ src/buffer-pool.hpp  |  10 ++
+ src/frame-writer.cpp |  37 ++++++-
+ src/frame-writer.hpp |  10 ++
+ src/main.cpp         | 228 +++++++++++++++++++++++++++++++++++--------
+ 4 files changed, 243 insertions(+), 42 deletions(-)
+
+diff --git a/src/buffer-pool.hpp b/src/buffer-pool.hpp
+index cb6394a..5ae0cae 100644
+--- a/src/buffer-pool.hpp
++++ b/src/buffer-pool.hpp
+@@ -79,6 +79,16 @@ public:
+         changed.wait(lock, [&] { return stop || bufs[encode_idx]->ready_encode(); });
+     }
+ 
++    // As wait_encode(), giving up at deadline; false if it did.
++    template <class Clock, class Duration>
++    bool wait_encode_until(const std::atomic<bool>& stop,
++        const std::chrono::time_point<Clock, Duration>& deadline)
++    {
++        std::unique_lock<std::mutex> lock(mutex);
++        return changed.wait_until(lock, deadline,
++            [&] { return stop || bufs[encode_idx]->ready_encode(); });
++    }
++
+     // Wake the waiters so they notice a stop request.
+     void wake()
+     {
+diff --git a/src/frame-writer.cpp b/src/frame-writer.cpp
+index 3800e04..acffed1 100644
+--- a/src/frame-writer.cpp
++++ b/src/frame-writer.cpp
+@@ -297,7 +297,7 @@ void FrameWriter::init_video_filters(const AVCodec *codec)
+             params.video_filter = transpose_from_transform(params.transform);
+         }
+     }
+-    if (params.framerate != 0){
++    if (params.framerate != 0 && !params.cfr){
+         if (params.video_filter != "null" && params.video_filter.find("fps") == std::string::npos) {
+             params.video_filter += ",fps=" + std::to_string(params.framerate);
+         }
+@@ -472,7 +472,9 @@ void FrameWriter::init_video_filters(const AVCodec *codec)
+     this->videoCodecCtx->height = filter_output->h;
+     this->videoCodecCtx->pix_fmt = (AVPixelFormat)filter_output->format;
+     this->videoCodecCtx->time_base = filter_output->time_base;
+-    this->videoCodecCtx->framerate = AVRational{1,0};
++    /* Rate control needs the real frame rate when timestamps are in
++     * microseconds. */
++    this->videoCodecCtx->framerate = params.cfr ? AVRational{params.framerate, 1} : AVRational{1,0};
+     this->videoCodecCtx->sample_aspect_ratio = filter_output->sample_aspect_ratio;
+ 
+     this->hw_frame_context = av_buffersink_get_hw_frames_ctx(
+@@ -499,6 +501,9 @@ void FrameWriter::init_video_stream()
+         std::cerr << "Failed to open stream" << std::endl;
+         std::exit(-1);
+     }
++    /* Muxers such as FLV announce it; the timestamps alone do not. */
++    if (params.cfr)
++        videoStream->avg_frame_rate = AVRational{params.framerate, 1};
+ 
+     videoCodecCtx = avcodec_alloc_context3(codec);
+     videoCodecCtx->width      = params.width;
+@@ -841,6 +846,12 @@ bool FrameWriter::push_frame(AVFrame *frame, int64_t usec)
+ 
+         filtered_frame->pict_type = AV_PICTURE_TYPE_NONE;
+ 
++        if (params.cfr) {
++            av_frame_free(&last_frame);
++            last_frame = filtered_frame;
++            continue;
++        }
++
+         // So we have a frame. Encode it!
+         AVPacket *pkt = av_packet_alloc();
+         pkt->data = NULL;
+@@ -855,6 +866,26 @@ bool FrameWriter::push_frame(AVFrame *frame, int64_t usec)
+     return true;
+ }
+ 
++bool FrameWriter::encode_last_frame(int64_t usec)
++{
++    if (!last_frame)
++        return true;
++
++    AVFrame *frame = av_frame_clone(last_frame);
++    AVPacket *pkt = av_packet_alloc();
++    if (!frame || !pkt) {
++        av_frame_free(&frame);
++        av_packet_free(&pkt);
++        return false;
++    }
++
++    frame->pts = usec;
++    encode(videoCodecCtx, frame, pkt);
++    av_frame_free(&frame);
++    av_packet_free(&pkt);
++    return true;
++}
++
+ bool FrameWriter::add_frame(const uint8_t* pixels, int64_t usec, bool y_invert)
+ {
+     /* Calculate data after y-inversion */
+@@ -1053,6 +1084,8 @@ void FrameWriter::finish_frame(AVCodecContext *enc_ctx, AVPacket& pkt)
+ 
+ FrameWriter::~FrameWriter()
+ {
++    av_frame_free(&last_frame);
++
+     // Writing the delayed frames:
+     AVPacket *pkt = av_packet_alloc();
+ 
+diff --git a/src/frame-writer.hpp b/src/frame-writer.hpp
+index 331e7c3..2410322 100644
+--- a/src/frame-writer.hpp
++++ b/src/frame-writer.hpp
+@@ -66,6 +66,9 @@ struct FrameWriterParams
+     std::map<std::string, std::string> codec_options;
+     std::map<std::string, std::string> audio_codec_options;
+     int framerate = 0;
++    /* Encode on a real-time clock at framerate, repeating the last frame
++     * when the compositor sends none (see encode_last_frame()). */
++    bool cfr = false;
+     int sample_rate;
+     int buffrate = 0;
+     int32_t transform = 0;
+@@ -102,6 +105,9 @@ class FrameWriter
+ 
+     std::map<struct gbm_bo*, AVFrame*> mapped_frames;
+ 
++    /* With cfr: the most recent converted frame, ready to be encoded. */
++    AVFrame *last_frame = NULL;
++
+     AVPixelFormat lookup_pixel_format(std::string pix_fmt);
+     AVPixelFormat handle_buffersink_pix_fmt(const AVCodec *codec);
+     AVPixelFormat get_input_format();
+@@ -128,6 +134,10 @@ class FrameWriter
+     bool add_frame(const uint8_t* pixels, int64_t usec, bool y_invert);
+     bool add_frame(struct gbm_bo *bo, int64_t usec, bool y_invert);
+ 
++    /* With cfr, add_frame() only converts; this encodes the last added
++     * frame with the given timestamp, as often as the clock asks. */
++    bool encode_last_frame(int64_t usec);
++
+ #ifdef HAVE_AUDIO
+     /* Buffer must have size get_audio_buffer_size() */
+     void add_audio(const void* buffer);
+diff --git a/src/main.cpp b/src/main.cpp
+index bdefc3a..0bf6881 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -637,6 +637,54 @@ static InputFormat get_input_format(wf_buffer& buffer)
+     }
+ }
+ 
++/* --cfr: frames are placed on a grid of slots at the frame rate, anchored
++ * on the first frame. A frame goes to the slot nearest to when it was
++ * rendered; a slot whose window passes without one repeats the last
++ * frame. Short gaps (a busy encoder) are filled, long ones (a stall)
++ * are not, so the output never runs ahead of real time. */
++#define CFR_MAX_FILL 2
++
++static uint64_t monotonic_usec()
++{
++    timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return timespec_to_usec(ts);
++}
++
++struct frame_clock
++{
++    int fps;
++    uint64_t origin;
++    int64_t last_slot = -1;
++    uint64_t captured = 0;
++    uint64_t repeated = 0;
++
++    uint64_t slot_time(int64_t slot) const
++    {
++        return origin + slot * 1000000 / fps;
++    }
++
++    /* The slot whose window contains t. */
++    int64_t slot_at(uint64_t t) const
++    {
++        if (t < origin)
++            return 0;
++        return ((t - origin) * fps + 500000) / 1000000;
++    }
++
++    /* The last slot whose window has closed by t. */
++    int64_t closed_by(uint64_t t) const
++    {
++        return ((int64_t)(t - origin) * fps - 500000) / 1000000;
++    }
++
++    std::chrono::steady_clock::time_point next_deadline() const
++    {
++        uint64_t end = slot_time(last_slot + 1) + 500000 / fps;
++        return std::chrono::steady_clock::time_point(std::chrono::microseconds(end));
++    }
++};
++
+ static void write_loop(FrameWriterParams params)
+ {
+     /* Ignore SIGTERM/SIGINT/SIGHUP, main loop is responsible for the exit_main_loop signal */
+@@ -653,15 +701,97 @@ static void write_loop(FrameWriterParams params)
+ #endif
+ 
+     std::optional<uint64_t> first_frame_ts;
++    std::optional<frame_clock> clock;
++    bool clock_waits_for_audio = false;
++    uint64_t captured_before_clock = 0;
++
++    /* Encode the last frame again for slot (and the ones it skipped). */
++    auto repeat_until = [&] (int64_t slot) {
++        if (slot - clock->last_slot - 1 > CFR_MAX_FILL)
++            clock->last_slot = slot - 1;
++        while (clock->last_slot < slot) {
++            ++clock->last_slot;
++            ++clock->repeated;
++            if (!frame_writer->encode_last_frame(clock->slot_time(clock->last_slot) - first_frame_ts.value()))
++                return false;
++        }
++        return true;
++    };
++
++    /* --cfr: start the clock with the audio, showing the newest frame. A
++     * still screen sends no further frames, so the first slot cannot wait
++     * for one. */
++    auto start_clock = [&] (uint64_t frame_time) {
++        uint64_t origin = frame_time;
++#ifdef HAVE_AUDIO
++        if (pr) {
++            if (!pr->get_time_base()) {
++                clock_waits_for_audio = true;
++                return true;
++            }
++            origin = pr->get_time_base();
++        }
++#endif
++        clock_waits_for_audio = false;
++        first_frame_ts = origin;
++        clock = frame_clock{params.framerate, origin};
++        clock->captured = captured_before_clock;
++        clock->last_slot = 0;
++        return frame_writer->encode_last_frame(0);
++    };
++
++    auto add_frame = [&] (wf_buffer& buffer, uint64_t sync_timestamp) {
++        if (use_dmabuf && use_hwupload) {
++            uint32_t stride = 0;
++            void *map_data = NULL;
++            void *data = gbm_bo_map(buffer.bo, 0, 0, buffer.width, buffer.height,
++                GBM_BO_TRANSFER_READ, &stride, &map_data);
++            if (!data) {
++                std::cerr << "Failed to map bo" << std::endl;
++                return false;
++            }
++            bool ok = frame_writer->add_frame((unsigned char*)data, sync_timestamp, buffer.y_invert);
++            gbm_bo_unmap(buffer.bo, map_data);
++            return ok;
++        }
++        if (use_dmabuf)
++            return frame_writer->add_frame(buffer.bo, sync_timestamp, buffer.y_invert);
++        return frame_writer->add_frame((unsigned char*)buffer.data, sync_timestamp, buffer.y_invert);
++    };
+ 
+     while(!exit_main_loop)
+     {
+-        // wait for frame to become available
+-        buffers.wait_encode(exit_main_loop);
++        // wait for frame to become available, or for the frame clock
++        bool ready = true;
++        if (clock) {
++            ready = buffers.wait_encode_until(exit_main_loop, clock->next_deadline());
++        } else if (clock_waits_for_audio) {
++            ready = buffers.wait_encode_until(exit_main_loop,
++                std::chrono::steady_clock::now() + std::chrono::milliseconds(5));
++        } else {
++            buffers.wait_encode(exit_main_loop);
++        }
+         if (exit_main_loop) {
+             break;
+         }
+ 
++        if (!ready) {
++            frame_writer_pending_mutex.lock();
++            frame_writer_mutex.lock();
++            frame_writer_pending_mutex.unlock();
++            bool ok;
++            if (clock) {
++                ok = repeat_until(std::max(clock->last_slot + 1, clock->closed_by(monotonic_usec())));
++            } else {
++                ok = start_clock(monotonic_usec());
++            }
++            frame_writer_mutex.unlock();
++            if (!ok) {
++                break;
++            }
++            continue;
++        }
++
+         auto& buffer = buffers.encode();
+ 
+         frame_writer_pending_mutex.lock();
+@@ -699,50 +829,47 @@ static void write_loop(FrameWriterParams params)
+ #endif
+         }
+ 
+-        bool drop = false;
+-        uint64_t sync_timestamp = 0;
+-        if (first_frame_ts.has_value()) {
+-            sync_timestamp = buffer.base_usec - first_frame_ts.value();
+-#ifdef HAVE_AUDIO
+-        } else if (pr) {
+-            if (!pr->get_time_base() || pr->get_time_base() > buffer.base_usec) {
+-                drop = true;
+-            } else {
+-                first_frame_ts = pr->get_time_base();
+-                sync_timestamp = buffer.base_usec - first_frame_ts.value();
++        bool do_cont = true;
++        if (params.cfr) {
++            int64_t slot = 0;
++            if (clock) {
++                slot = clock->slot_at(buffer.base_usec);
++                /* Slots this frame jumped over still show the previous one. */
++                if (slot > clock->last_slot + 1)
++                    do_cont = repeat_until(slot - 1);
++            }
++            do_cont = do_cont && add_frame(buffer, buffer.base_usec);
++            if (do_cont && !clock) {
++                ++captured_before_clock;
++                do_cont = start_clock(buffer.base_usec);
++            } else if (do_cont) {
++                ++clock->captured;
++                /* A frame for a slot already encoded waits for the next one. */
++                if (slot > clock->last_slot) {
++                    clock->last_slot = slot;
++                    do_cont = frame_writer->encode_last_frame(clock->slot_time(slot) - first_frame_ts.value());
++                }
+             }
+-#endif
+         } else {
+-            sync_timestamp = 0;
+-            first_frame_ts = buffer.base_usec;
+-        }
+-
+-        bool do_cont = false;
+-
+-        if (!drop) {
+-            if (use_dmabuf) {
+-                if (use_hwupload) {
+-                    uint32_t stride = 0;
+-                    void *map_data = NULL;
+-                    void *data = gbm_bo_map(buffer.bo, 0, 0, buffer.width, buffer.height,
+-                        GBM_BO_TRANSFER_READ, &stride, &map_data);
+-                    if (!data) {
+-                        std::cerr << "Failed to map bo" << std::endl;
+-                        break;
+-                    }
+-                    do_cont = frame_writer->add_frame((unsigned char*)data,
+-                        sync_timestamp, buffer.y_invert);
+-                    gbm_bo_unmap(buffer.bo, map_data);
++            bool drop = false;
++            uint64_t sync_timestamp = 0;
++            if (first_frame_ts.has_value()) {
++                sync_timestamp = buffer.base_usec - first_frame_ts.value();
++#ifdef HAVE_AUDIO
++            } else if (pr) {
++                if (!pr->get_time_base() || pr->get_time_base() > buffer.base_usec) {
++                    drop = true;
+                 } else {
+-                    do_cont = frame_writer->add_frame(buffer.bo,
+-                        sync_timestamp, buffer.y_invert);
++                    first_frame_ts = pr->get_time_base();
++                    sync_timestamp = buffer.base_usec - first_frame_ts.value();
+                 }
++#endif
+             } else {
+-                do_cont = frame_writer->add_frame((unsigned char*)buffer.data,
+-                    sync_timestamp, buffer.y_invert);
++                sync_timestamp = 0;
++                first_frame_ts = buffer.base_usec;
+             }
+-        } else {
+-            do_cont = true;
++            if (!drop)
++                do_cont = add_frame(buffer, sync_timestamp);
+         }
+ 
+         frame_writer_mutex.unlock();
+@@ -754,6 +881,11 @@ static void write_loop(FrameWriterParams params)
+         buffers.next_encode();
+     }
+ 
++    if (clock) {
++        std::cerr << "cfr: " << clock->captured << " frames captured, " << clock->repeated
++            << " repeated, " << clock->last_slot + 1 << " slots" << std::endl;
++    }
++
+     std::lock_guard<std::mutex> lock(frame_writer_mutex);
+     /* Free the AudioReader connection first. This way it'd flush any remaining
+      * frames to the FrameWriter */
+@@ -953,6 +1085,11 @@ Use Ctrl+C to stop.)");
+                             using a GPU encoder. However, this can cause issues on some systems. In such
+                             cases, this option will disable the GPU copy and force a CPU one.
+ 
++  --cfr                     Keep the -r frame rate constant in real time while still capturing
++                            only when the screen updates: when no new frame arrives in time, the
++                            last one is encoded again. Unlike --no-damage, the compositor does
++                            not redraw the screen for every frame. Meant for live streaming.
++
+   -D, --no-damage           By default, wf-recorder will request a new frame from the compositor
+                             only when the screen updates. This results in a much smaller output
+                             file, which however has a variable refresh rate. When this option is
+@@ -1194,6 +1331,7 @@ int main(int argc, char *argv[])
+         { "buffrate",          required_argument, NULL, 'B' },
+         { "version",           no_argument,       NULL, 'v' },
+         { "no-damage",         no_argument,       NULL, 'D' },
++        { "cfr",               no_argument,       NULL, '^' },
+         { "overwrite",         no_argument,       NULL, 'y' },
+         { "list-output",       no_argument,       NULL, 'L' },
+         { 0,                   0,                 NULL,  0  }
+@@ -1290,6 +1428,10 @@ int main(int argc, char *argv[])
+                 use_damage = false;
+                 break;
+ 
++            case '^':
++                params.cfr = true;
++                break;
++
+             case 'P':
+                 parse_codec_opts(params.audio_codec_options, optarg);
+                 break;
+@@ -1315,6 +1457,12 @@ int main(int argc, char *argv[])
+         }
+     }
+ 
++    if (params.cfr && params.framerate <= 0)
++    {
++        std::cerr << "--cfr needs a frame rate (-r)" << std::endl;
++        return EXIT_FAILURE;
++    }
++
+     if (!force_overwrite && !user_specified_overwrite(params.file))
+     {
+         return EXIT_FAILURE;
