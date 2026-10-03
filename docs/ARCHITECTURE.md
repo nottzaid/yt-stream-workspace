@@ -72,9 +72,10 @@ selection is invariant.
 
 ## Preview contract
 
-`wl-mirror` is a preview, not the capture boundary. A window rule places it
-fullscreen on the `stream-preview` workspace without decorations, animation,
-blur, or focus.
+`wl-mirror` is a preview, not the capture boundary. It is started outside the
+caller's process tree so Hyprland's window swallowing never hides the terminal
+that ran `workspace-stream start`, and a window rule places it fullscreen on
+the `stream-preview` workspace without decorations, animation, blur, or focus.
 Its automatic backend order prefers `extcopy-dmabuf`, then other DMA-BUF
 paths, before shared-memory fallbacks. `YTWS_MIRROR_BACKEND=extcopy-dmabuf`
 makes a path without a CPU framebuffer copy a requirement on systems that

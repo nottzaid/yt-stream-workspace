@@ -162,6 +162,15 @@ port_is_listening() {
     ss -H -ltn | awk -v suffix=":$port" '$4 ~ suffix "$" { found=1 } END { exit !found }'
 }
 
+# Start a GUI helper outside the caller's process tree and print its PID.
+# Hyprland's window swallowing hides a terminal behind any window started
+# from it; a helper reparented away from the terminal never swallows it.
+spawn_detached() {
+    local log="$1"
+    shift
+    (setsid "$@" </dev/null >"$log" 2>&1 & printf '%s\n' "$!")
+}
+
 stop_pid() {
     local pid="${1:-}" name="$2"
     pid_is_command "$pid" "$name" || return 0
@@ -479,10 +488,11 @@ discard_stale_session() {
 # wl-mirror's --fullscreen-output would make Hyprland move it onto whatever
 # workspace that monitor is showing instead.
 start_mirror() {
-    wl-mirror --backend "$MIRROR_BACKEND" --show-cursor \
-        --scaling fit --title "$PREVIEW_TITLE" "$OUTPUT" \
-        >"$LOG_DIR/wl-mirror.log" 2>&1 &
-    MIRROR_PID=$!
+    MIRROR_PID="$(
+        spawn_detached "$LOG_DIR/wl-mirror.log" \
+            wl-mirror --backend "$MIRROR_BACKEND" --show-cursor \
+            --scaling fit --title "$PREVIEW_TITLE" "$OUTPUT"
+    )"
 }
 
 abort_start() {
@@ -499,7 +509,7 @@ abort_start() {
 
 start_session() {
     validate_config
-    require_commands hyprctl jq pactl wl-mirror wf-recorder ffmpeg ss
+    require_commands hyprctl jq pactl wl-mirror wf-recorder ffmpeg ss setsid
     discard_stale_session
     ensure_module
     output_exists && die "Hyprland output '$OUTPUT' already exists"
@@ -536,8 +546,9 @@ start_session() {
     wait_until "configured output mode" output_matches_config
 
     if command -v swaybg >/dev/null 2>&1 && [[ -f "$WALLPAPER" ]]; then
-        swaybg -o "$OUTPUT" -i "$WALLPAPER" >"$LOG_DIR/swaybg.log" 2>&1 &
-        WALLPAPER_PID=$!
+        WALLPAPER_PID="$(
+            spawn_detached "$LOG_DIR/swaybg.log" swaybg -o "$OUTPUT" -i "$WALLPAPER"
+        )"
     fi
 
     audio_start
@@ -761,8 +772,7 @@ start_live() {
     url="${YOUTUBE_RTMPS_URL%/}/$key"
 
     wf_recorder_args
-    wf-recorder "${WF_ARGS[@]}" -f "$url" >/dev/null 2>&1 &
-    LIVE_PID=$!
+    LIVE_PID="$(spawn_detached /dev/null wf-recorder "${WF_ARGS[@]}" -f "$url")"
     unset key url
     write_state
 
@@ -865,7 +875,7 @@ run_doctor() {
     printf 'logs: %s\n' "$LOG_DIR"
 
     local command
-    for command in hyprctl jq pactl wl-mirror wf-recorder ffmpeg ffprobe ss timeout; do
+    for command in hyprctl jq pactl wl-mirror wf-recorder ffmpeg ffprobe ss timeout setsid; do
         doctor_check_command "$command"
     done
     doctor_check_optional_command swaybg "only needed for virtual-output wallpaper"
@@ -963,7 +973,7 @@ focused_monitor() {
 
 run_self_test() {
     validate_config
-    require_commands hyprctl jq kitty wtype ffmpeg ffprobe timeout
+    require_commands hyprctl jq kitty wtype ffmpeg ffprobe timeout setsid
     [[ ! -e "$STATE_FILE" ]] || die "stop the existing stream session before self-test"
     ensure_module
 
@@ -988,9 +998,10 @@ run_self_test() {
     test_window_mapped() {
         hyprctl -j clients | jq -e --argjson pid "$test_pid" 'any(.[]; .pid == $pid and .mapped)' >/dev/null
     }
-    kitty --class yt-stream-workspace-test --title YT-Stream-Workspace-Test \
-        "$SELF" _self-test-window "$marker" >/dev/null 2>&1 &
-    test_pid=$!
+    test_pid="$(
+        spawn_detached /dev/null kitty --class yt-stream-workspace-test \
+            --title YT-Stream-Workspace-Test "$SELF" _self-test-window "$marker"
+    )"
     wait_until "test window" test_window_mapped
     hyprctl dispatch "hl.dsp.window.move({ workspace = \"$test_workspace\", window = \"pid:$test_pid\", follow = false })" >/dev/null
 
