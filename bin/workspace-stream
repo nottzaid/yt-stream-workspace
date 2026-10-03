@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # workspace-stream: stream one Hyprland workspace to YouTube while every other
 # workspace stays private. The compositor side of the boundary lives in
-# hyprland/yt-stream-workspace.lua; see docs/ARCHITECTURE.md.
+# hyprland/yt-stream-workspace.lua; README.md explains the design.
 set -Eeuo pipefail
 
 PROTOCOL=1

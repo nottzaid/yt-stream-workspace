@@ -1,240 +1,188 @@
 # yt-stream-workspace
 
-Stream one Hyprland workspace to YouTube while private workspaces remain local.
+Stream one Hyprland workspace to YouTube; every other workspace stays private.
 
 ```text
-stream workspace → headless output YT-STREAM → wf-recorder → YouTube
-                         │
-                         └→ wl-mirror preview on the physical monitor
+workspace N → headless output YT-STREAM → wf-recorder → YouTube
+                    └→ preview window on your monitor
 ```
 
-Viewers see exactly one Hyprland output, `YT-STREAM`. While a session runs,
-Hyprland itself keeps that boundary: the `yt-stream-workspace.lua` module reacts
-inside the compositor's own event handlers, before a frame can be rendered or
-captured, so no other workspace and no special workspace is ever shown there,
-whichever key, script, or monitor change tries. Bars, notifications, launchers,
-and other layer surfaces on the stream output are painted black in the capture
-unless their namespace is allowed, and windows of password managers are always
-painted black.
+Viewers see one Hyprland output, `YT-STREAM`, and nothing else:
 
-Desktop and microphone audio are still mixed globally.
+- The Lua module corrects the layout inside Hyprland's own event handlers,
+  before a frame is rendered or captured. No other workspace, and no special
+  workspace, ever reaches the output, whatever key, script or monitor change
+  tries.
+- On the output, layer surfaces (bars, notifications, launchers) are painted
+  black in the capture unless allowed, and so are password-manager windows.
+- The recorder only ever records `-o YT-STREAM`, never "whatever is focused".
 
 ## Install
 
-The supported fast path is Arch/CachyOS with Hyprland:
+Arch/CachyOS:
 
 ```sh
-git clone https://github.com/muradkant/yt-stream-workspace.git
-cd yt-stream-workspace
-./install.sh --deps --hypr-source
+./install.sh --deps --hypr-source --native
 hyprctl reload
-workspace-stream doctor
-workspace-stream self-test
+workspace-stream doctor && workspace-stream self-test
 ```
 
-`--deps` installs `wf-recorder`, `wl-mirror`, `jq`, `ffmpeg`, `pipewire-pulse`,
-`kitty`, `wtype`, and `iproute2` through pacman. On another distribution,
-install those commands yourself and run `./install.sh --hypr-source`.
-`swaybg` adds an optional virtual-output wallpaper; `shellcheck` strengthens
-development checks.
+- `--deps` installs the runtime packages (and the build tools with
+  `--native`).
+- `--hypr-source` adds `require("yt-stream-workspace")` to `hyprland.lua`,
+  editing through a symlink and refusing a read-only file.
+- `--native` builds the patched recorder and the preview client (see
+  [Performance](#performance)) into `~/.local/share/yt-stream-workspace/bin`.
+  Without them the tool falls back to stock `wf-recorder` and `wl-mirror`.
 
-Installation writes:
+`./uninstall.sh` removes exactly what was installed and restores what it
+replaced. `--purge` also removes the config.
 
-```text
-~/.local/bin/workspace-stream
-~/.config/yt-stream-workspace/config
-~/.config/hypr/yt-stream-workspace.lua
-```
-
-With `--hypr-source`, it backs up `hyprland.lua` (Hyprland 0.55+ replaced the
-hyprlang `.conf` format with Lua), appends `require("yt-stream-workspace")`
-only when absent, and records ownership so `./uninstall.sh` removes only the
-lines this installation added. A symlinked `hyprland.lua` is edited through the
-link; a read-only one is refused before anything is installed. The module calls
-no external command for its bindings, so non-default XDG paths need nothing
-special.
-
-The installer records whether it created or replaced each managed file.
-Replaced executables and modules are backed up and restored by uninstall. A
-normal uninstall preserves the user configuration; `--purge` removes a created
-config or restores a replaced one:
+## Use
 
 ```sh
-./uninstall.sh          # preserve config
-./uninstall.sh --purge  # remove created config or restore replaced config
+workspace-stream start 3     # isolate workspace 3 on the stream output
+workspace-stream test 5      # record locally; checks H.264, AAC and sound
+workspace-stream live        # go live; asks for the stream key
+workspace-stream stop-live   # stop delivery, keep the session
+workspace-stream stop        # restore everything
+workspace-stream status      # what viewers see and hear, delivery health
 ```
 
-## Stream
+`start` puts workspace 3 on a 1920x1080@60 headless output, placed below and
+apart from your monitors. The physical monitor gets a fullscreen preview on
+its own workspace, `stream-preview`. Input goes to the stream exactly when the
+stream output has focus:
 
-Prepare workspace 3:
+| Key | Command | Effect |
+|---|---|---|
+| `Super+F11` | `enter` | work in the stream through the preview |
+| `Super+F12` | `leave` | back to the workspace you came from |
+| `Super+F10` | `curtain` | viewers see an empty screen and hear nothing; the stream workspace comes to you |
 
-```sh
-workspace-stream start 3
-```
+Ordinary workspace keys work too. Rebind with
+`YTWS.bind({ enter = "SUPER + F9", curtain = false })` after the require line.
 
-This moves workspace 3 to a `1920x1080@60` headless output at scale 1.5, below
-and apart from your monitors so the pointer never wanders onto it, selects a
-working VAAPI H.264 render node, and creates the audio mix. A fullscreen preview
-of the stream lives on its own workspace, `stream-preview`, on the monitor
-workspace 3 came from. If you were working in workspace 3, you keep working in
-it.
+`live` returns once YouTube acknowledges data. A supervisor then keeps
+delivery going:
 
-Input is in the stream exactly when the stream output has focus, and the
-physical monitor then shows the preview:
+- It reconnects with backoff when the connection drops or stalls (nothing
+  acknowledged for 10 s), and notifies you.
+- After three refusals in a row it stops and says why, instead of looping.
+- It restarts a crashed preview.
+- It keeps the screen from blanking or locking while you are live.
 
-- `Super+F11` (`workspace-stream enter`) works in the stream; the pointer keeps
-  its place on the preview.
-- `Super+F12` (`workspace-stream leave`) returns to the workspace you came from.
-- Your ordinary workspace keys work too: the stream workspace's key enters,
-  any other key leaves, and a new workspace opened from the stream appears on
-  the physical monitor.
-- `Super+F10` (`workspace-stream curtain`) raises the curtain: viewers
-  instantly see an empty workspace and hear nothing, while the stream
-  workspace moves to your monitor so you can fix whatever needed hiding.
-  Press it again to resume.
+To go live from a key binding, set `YTWS_STREAM_KEY_COMMAND` or
+`YTWS_STREAM_KEY_FILE` (mode 600). The key never reaches a log, but
+wf-recorder's command line does contain it.
 
-Rebind the keys after the require line, for example
-`YTWS.bind({ enter = "SUPER + F9", curtain = false })`.
+## Audio
 
-Validate locally before publishing:
+Viewers hear the null sink `yt_stream_mix`. While something records, plain
+PipeWire links feed it the default output device's sound and the default
+microphone, and follow either when it changes. Nothing is rerouted and your own
+audio is untouched. Between recordings there are no links, so the microphone
+stays closed. Set `YTWS_DESKTOP_AUDIO` / `YTWS_MIC` to `none` or a node name to
+change the sources.
 
-```sh
-workspace-stream test 5
-```
+Desktop audio means everything your speakers play, including private
+workspaces' sound.
 
-The test starts a temporary RTMP receiver, records only `YT-STREAM`, injects a
-tone, and requires H.264 at the configured dimensions plus non-silent AAC.
+## Performance
 
-Start and stop YouTube delivery:
+`native/build.sh` builds two helpers that remove the tool's overhead where
+Hyprland allows it:
 
-```sh
-workspace-stream live       # asks for the stream key without echo
-workspace-stream stop-live  # leaves the prepared workspace intact
-workspace-stream stop       # restores workspace, output, audio, and processes
-```
+- **`ytws-preview`** captures the stream with ext-image-copy-capture and
+  attaches each GPU buffer to its window unchanged. It never draws, captures
+  only after the compositor has shown its last frame, and so does nothing while
+  hidden or while the stream is still. (wl-mirror redraws and recommits on
+  every frame.)
+- **Patched wf-recorder** (`native/wf-recorder/*.patch`, on a pinned upstream
+  commit):
+  - Captures with ext-image-copy-capture. A pending wlr-screencopy frame makes
+    Hyprland redraw the output at full rate even when nothing changes.
+  - `--cfr` keeps YouTube's constant 60 fps by re-encoding the last frame in
+    real time, instead of forcing redraws.
+  - Native PipeWire capture of exactly the mix node: no fallback to another
+    device, no Pulse round trip.
+  - No polling loops.
+  - Limited-range BT.709 video, labelled as such.
+  - A failure exit status whenever the recording cannot continue.
 
-`live` returns once YouTube is acknowledging the stream. From then on the
-session's supervisor keeps it going: if the connection drops or stalls (no data
-acknowledged for 10 seconds), it reconnects with a short backoff for as long as
-you stay live, and a desktop notification says so. A key YouTube refuses three
-times in a row stops with a clear message instead of retrying forever. To go
-live from a key binding, set `YTWS_STREAM_KEY_COMMAND` (for example a
-`secret-tool` or `pass` lookup) or `YTWS_STREAM_KEY_FILE` (mode 600). The key
-reaches the supervisor through a private pipe and is removed from every log;
-wf-recorder's own command line does contain it, which matters only on a machine
-shared with other users.
+Measured on an i7-8565U / UHD 620 at 1080p60 (CPU as % of one core, GPU as
+render-engine busy time):
 
-While you are live the screen does not blank or lock: a blanked headless
-output freezes the stream, and a lock screen is drawn on the stream output too.
+| | before | now |
+|---|---|---|
+| Preview shown, still stream | 12.5% CPU, 28.8% GPU | 0.6% CPU, 0.8% GPU |
+| Live, still stream: Hyprland | 13.4% CPU, 40.6% GPU | 2.3% CPU, 4.2% GPU |
+| Session running, not live: audio graph | ~11% CPU | 0 |
+| Live, content changing every frame: total | 58.8% CPU | 53.4% CPU |
 
-`workspace-stream self-test` performs the entire local lifecycle on a temporary
-workspace: virtual output, test terminal, keyboard handoff, return to the
-physical monitor, RTMP, video, audio, and cleanup.
-
-`workspace-stream status` reports the YouTube state (live time, delivered
-bitrate, reconnects, or the reason it stopped), what the stream shows, where
-your input is, the layer surfaces on the stream output and whether each is
-hidden, and the corrections the guard has made. `status --json` gives the same
-for a bar widget.
-
-## Preview performance
-
-The preview defaults to `wl-mirror`'s `auto` backend. It tries the GPU DMA-BUF
-paths before shared memory; current Hyprland and wl-mirror releases normally
-select `extcopy-dmabuf`. To reject a slower fallback instead of accepting it:
-
-```sh
-YTWS_MIRROR_BACKEND=extcopy-dmabuf
-```
-
-The recorder is also kept on the GPU: wf-recorder captures `YT-STREAM` through
-DMA-BUF and H.264 encoding uses a tested VAAPI render node. `--no-damage` keeps
-moving output paced at the configured 60 fps rather than recording only damage
-events.
-
-There is still an unavoidable distinction from a normal workspace. A normal
-workspace is presented once; this design renders the headless output and then
-presents a copied GPU buffer in a physical-output window. That can add a frame
-of preview latency even when no frames are dropped. Hyprland's compositor-native
-monitor mirroring is deliberately not used: it removes the physical output from
-the logical layout and migrates its private workspaces onto the captured output,
-which breaks the isolation contract.
-
-`workspace-stream test` verifies encoded frame rate and media shape. It cannot
-measure human-perceived input-to-preview latency. If preview motion is uneven,
-first run `workspace-stream doctor`, require `extcopy-dmabuf`, and inspect the
-persistent logs before changing resolution or frame rate.
+The remaining cost of a busy stream is Hyprland's: rendering the output,
+copying each frame to the recorder and to the preview, and compositing the
+preview. Hyprland also disables direct scanout while anything is captured.
+Native monitor mirroring is not used: it would migrate your private workspaces
+onto the captured output.
 
 ## Configure
 
-Edit `~/.config/yt-stream-workspace/config`:
+`~/.config/yt-stream-workspace/config` (see `config.example`):
 
-```sh
-YTWS_OUTPUT=YT-STREAM
-YTWS_WIDTH=1920
-YTWS_HEIGHT=1080
-YTWS_FPS=60
-YTWS_SCALE=1.5
-YTWS_MIRROR_BACKEND=auto
-YTWS_VIDEO_BITRATE=12M
-YTWS_VIDEO_GOP=120
-```
-
-Leave `YTWS_VAAPI_DEVICE` unset unless detection chooses badly. The script tests
-each `/dev/dri/renderD*` with a tiny FFmpeg H.264 encode and keeps the first
-working node. Intel integrated graphics commonly provide this path; MX110/130
-class NVIDIA GPUs do not provide NVENC.
-
-The default audio graph sends desktop output to both the real speakers and a
-stream sink, then loops the default microphone into that stream sink. If a
-private application's audio must not leak, give it a separate PipeWire routing
-policy before going live; visual separation cannot solve audio routing.
+| Setting | Default | |
+|---|---|---|
+| `YTWS_OUTPUT`, `_WIDTH`, `_HEIGHT`, `_FPS`, `_SCALE` | `YT-STREAM`, 1920, 1080, 60, 1.5 | the stream output |
+| `YTWS_VIDEO_BITRATE`, `_GOP`, `YTWS_AUDIO_BITRATE` | 12M, 120, 128k | YouTube's 1080p60 shape |
+| `YTWS_DESKTOP_AUDIO`, `YTWS_MIC` | `default` | what viewers hear |
+| `YTWS_STREAM_LAYERS` | wallpapers | layer namespaces left visible |
+| `YTWS_PRIVATE_WINDOWS` | password managers | window classes always blacked out |
+| `YTWS_PREVIEW_MONITOR` | where the workspace was | |
+| `YTWS_RECORDER`, `YTWS_PREVIEW` | native builds, else PATH | |
+| `YTWS_VAAPI_DEVICE` | first render node that encodes H.264 | |
 
 ## Diagnose
 
-```sh
-workspace-stream status
-workspace-stream doctor
-```
+`workspace-stream doctor` checks prerequisites. If a start fails midway,
+`workspace-stream stop` restores everything. `workspace-stream logs` names the
+log directory, `${XDG_STATE_HOME:-~/.local/state}/yt-stream-workspace`, which
+outlives sessions.
 
-If startup fails midway, `workspace-stream stop` is the first recovery step.
-If the local RTMP port is occupied, change `YTWS_TEST_RTMP_PORT` (default
-19350). If encoding fails, inspect `/dev/dri/renderD*` and set the tested node as
-`YTWS_VAAPI_DEVICE`.
+## How it works
 
-Logs survive session cleanup:
+- **Guard.** `hyprland/yt-stream-workspace.lua` keeps one invariant, from
+  `workspace.*` and `monitor.*` events: the output shows the stream workspace
+  (or the curtain) and no special workspace.
+  - Synchronously, it hides any special workspace there and re-activates the
+    stream workspace. Workspaces Hyprland migrated onto the output stay
+    inactive (never rendered) until the next tick moves them home.
+  - It arms before the output exists, so a recreated output's remembered
+    workspaces are undone like anything else.
+  - After a config reload it re-arms from
+    `$XDG_RUNTIME_DIR/yt-stream-workspace/compositor.lua`.
+- **Handoff.** Focus changes from any source are followed on the next tick,
+  because Hyprland announces a focus change before recording it. The preview
+  has `no_focus`, and the pointer is carried between preview and output at the
+  matching position.
+- **Supervisor.** One detached process per session owns the preview, the
+  wallpaper, wf-recorder and the audio links:
+  - Commands, and the stream key, arrive on a mode-600 FIFO.
+  - Delivery is judged by the socket's `bytes_acked` from `ss`, not by bytes
+    written.
+  - Helpers stop with TERM.
+  - An idle tick forks nothing.
+- **State.** Everything lives in the mode-700
+  `$XDG_RUNTIME_DIR/yt-stream-workspace/`. The session's configuration is
+  snapshotted at `start`, so `stop` always removes what was created. A state
+  file from an earlier Hyprland instance is discarded.
+  - `stop` verifies helper identity before signalling it, and checks that the
+    output is really gone, since Hyprland can report errors with exit status 0.
 
-```sh
-workspace-stream logs
-```
-
-They are stored under
-`${XDG_STATE_HOME:-~/.local/state}/yt-stream-workspace`. Runtime ownership state
-remains separate under `XDG_RUNTIME_DIR` and is removed after successful
-cleanup.
-
-The recorder's safety-critical shape is always:
-
-```sh
-wf-recorder -o YT-STREAM --audio=yt_stream_mix.monitor ...
-```
-
-Never substitute process location for `-o` output selection.
-
-## Verify and develop
-
-Repository checks are reproducible without modifying the real home directory:
-
-```sh
-make test   # syntax, ShellCheck, CLI/config behavior
-make smoke  # isolated install, command load, and owned-config uninstall
-```
-
-Runtime verification needs a live Hyprland/PipeWire session:
+## Develop
 
 ```sh
-workspace-stream self-test
+make test    # syntax, ShellCheck, Lua guard model, CLI and supervisor tests
+make smoke   # isolated install and uninstall
+native/build.sh /tmp/native   # build the helpers anywhere
+workspace-stream self-test    # full lifecycle in a live Hyprland session
 ```
-
-[Architecture](docs/ARCHITECTURE.md) defines the capture, audio, state, and
-cleanup contracts.
