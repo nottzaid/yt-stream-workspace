@@ -34,3 +34,16 @@ YTWS_YOUTUBE_RTMPS_URL=rtmps://a.rtmps.youtube.com/live2
 
 # Optional wallpaper on the virtual output, if swaybg is installed.
 YTWS_WALLPAPER="$HOME/Pictures/background.jpg"
+
+# Monitor that shows the preview. Empty means the monitor the stream workspace
+# was on when the session started.
+# YTWS_PREVIEW_MONITOR=eDP-1
+
+# Layer surfaces on the stream output (bars, notifications, launchers, ...)
+# are painted black in the capture unless their namespace fully matches this
+# regular expression. `workspace-stream status` lists the namespaces present.
+YTWS_STREAM_LAYERS='.*wallpaper.*|hyprpaper|swww-daemon|mpvpaper.*'
+
+# Windows whose class fully matches this regular expression are always painted
+# black in the capture. Set it to an empty string to disable.
+YTWS_PRIVATE_WINDOWS='org\.keepassxc\.KeePassXC|KeePassXC|1[Pp]assword|[Bb]itwarden|com\.bitwarden\.desktop|gcr-prompter|org\.gnome\.seahorse\.Application'

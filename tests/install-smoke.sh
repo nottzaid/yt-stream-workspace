@@ -12,7 +12,6 @@ export XDG_BIN_HOME XDG_CONFIG_HOME
 HYPR_DIR="$XDG_CONFIG_HOME/hypr"
 CONFIG_DIR="$XDG_CONFIG_HOME/yt-stream-workspace"
 REQUIRE_LINE='require("yt-stream-workspace")'
-printf -v QUOTED_BIN '%q' "$XDG_BIN_HOME/workspace-stream"
 
 # A missing Hyprland root config must fail before writing a partial install.
 if XDG_BIN_HOME="$TMP/missing-bin" XDG_CONFIG_HOME="$TMP/missing-config" \
@@ -42,7 +41,7 @@ test -x "$XDG_BIN_HOME/workspace-stream"
 test -r "$CONFIG_DIR/config"
 test -r "$HYPR_DIR/yt-stream-workspace.lua"
 grep -Fqx "$REQUIRE_LINE" "$HYPR_DIR/hyprland.lua"
-grep -Fq "$QUOTED_BIN" "$HYPR_DIR/yt-stream-workspace.lua"
+cmp "$ROOT/hyprland/yt-stream-workspace.lua" "$HYPR_DIR/yt-stream-workspace.lua"
 test -e "$CONFIG_DIR/hypr-source-added"
 test "$(sed -n '1p' "$CONFIG_DIR/.install-state/bin")" = created
 test "$(sed -n '1p' "$CONFIG_DIR/.install-state/config")" = created

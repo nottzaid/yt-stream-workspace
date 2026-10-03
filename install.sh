@@ -105,18 +105,7 @@ else
 fi
 
 install_hypr_module() {
-    local target="$HYPR_DIR/yt-stream-workspace.lua"
-    local quoted_bin escaped_bin temporary
-
-    printf -v quoted_bin '%q' "$BIN_DIR/workspace-stream"
-    escaped_bin="${quoted_bin//\\/\\\\}"
-    escaped_bin="${escaped_bin//&/\\&}"
-    escaped_bin="${escaped_bin//|/\\|}"
-    temporary="$(mktemp "$HYPR_DIR/.yt-stream-workspace.lua.XXXXXX")"
-    sed "s|~/.local/bin/workspace-stream|$escaped_bin|g" \
-        "$ROOT/hyprland/yt-stream-workspace.lua" >"$temporary"
-    install -m 644 "$temporary" "$target"
-    rm -f "$temporary"
+    install -m 644 "$ROOT/hyprland/yt-stream-workspace.lua" "$HYPR_DIR/yt-stream-workspace.lua"
 }
 
 if [[ ! -e "$HYPR_DIR/yt-stream-workspace.lua" ]]; then

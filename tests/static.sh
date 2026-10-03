@@ -7,7 +7,16 @@ bash -n "$ROOT/bin/workspace-stream"
 bash -n "$ROOT/install.sh"
 bash -n "$ROOT/uninstall.sh"
 bash -n "$ROOT/tests/cli.sh"
+"$ROOT/tests/lua.sh"
 bash -n "$ROOT/tests/install-smoke.sh"
+bash -n "$ROOT/tests/lua.sh"
+
+LUAC="$(command -v luac || command -v luac5.4 || true)"
+if [[ -n "$LUAC" ]]; then
+    "$LUAC" -p "$ROOT/hyprland/yt-stream-workspace.lua" "$ROOT"/tests/lua/*.lua
+else
+    printf 'luac not installed; Lua syntax check skipped\n'
+fi
 
 # Match literal shell defaults; expansion here would weaken the assertion.
 # shellcheck disable=SC2016
@@ -22,7 +31,8 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$ROOT/install.sh" \
         "$ROOT/uninstall.sh" \
         "$ROOT/tests/cli.sh" \
-        "$ROOT/tests/install-smoke.sh"
+        "$ROOT/tests/install-smoke.sh" \
+        "$ROOT/tests/lua.sh"
 else
     printf 'shellcheck not installed; skipped\n'
 fi
