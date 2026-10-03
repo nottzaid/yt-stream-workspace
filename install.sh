@@ -11,7 +11,10 @@ BACKUP_DIR="$INSTALL_STATE_DIR/backups"
 BIN_MARKER="$INSTALL_STATE_DIR/bin"
 CONFIG_MARKER="$INSTALL_STATE_DIR/config"
 SNIPPET_MARKER="$INSTALL_STATE_DIR/hypr-snippet"
+NATIVE_MARKER="$INSTALL_STATE_DIR/native"
+NATIVE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/yt-stream-workspace/bin"
 FORCE=0
+NATIVE=0
 INSTALL_DEPS=0
 HYPR_SOURCE=0
 
@@ -26,11 +29,15 @@ for arg in "$@"; do
     --hypr-source)
         HYPR_SOURCE=1
         ;;
+    --native)
+        NATIVE=1
+        ;;
     -h|--help)
         printf 'Usage: ./install.sh [--force] [--deps] [--hypr-source]\n'
         printf '  --force        replace existing project files after backing them up\n'
         printf '  --deps         install Arch/CachyOS runtime dependencies with pacman\n'
         printf '  --hypr-source  append a require line for yt-stream-workspace to hyprland.lua if missing\n'
+        printf '  --native       build the patched wf-recorder and ytws-preview (native/build.sh)\n'
         exit 0
         ;;
     *)
@@ -45,7 +52,9 @@ if [[ "$INSTALL_DEPS" == 1 ]]; then
         printf 'install.sh: --deps requires pacman; install dependencies manually for this distro\n' >&2
         exit 1
     fi
-    sudo pacman -S --needed wf-recorder wl-mirror jq ffmpeg pipewire-pulse kitty wtype iproute2
+    packages=(wf-recorder wl-mirror jq ffmpeg pipewire pipewire-pulse kitty wtype iproute2)
+    [[ "$NATIVE" == 1 ]] && packages+=(git base-devel meson ninja wayland-protocols)
+    sudo pacman -S --needed "${packages[@]}"
 fi
 
 HYPR_LUA="$HYPR_DIR/hyprland.lua"
@@ -132,6 +141,11 @@ if [[ "$HYPR_SOURCE" == 1 ]]; then
         printf 'Added Hyprland require line to %s\n' "$HYPR_LUA_TARGET"
         printf 'Backup: %s\n' "$BACKUP"
     fi
+fi
+
+if [[ "$NATIVE" == 1 ]]; then
+    "$ROOT/native/build.sh" "$NATIVE_DIR"
+    printf '%s\n' "$NATIVE_DIR" >"$NATIVE_MARKER"
 fi
 
 printf 'Installed workspace-stream to %s/workspace-stream\n' "$BIN_DIR"
