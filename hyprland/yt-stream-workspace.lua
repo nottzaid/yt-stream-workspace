@@ -359,6 +359,15 @@ local function install_rules()
         rounding = 0,
         opaque = true,
     })
+    -- While live, keep the screen awake: an idle daemon would otherwise blank
+    -- the monitors (freezing the headless output) or lock the session, and a
+    -- lock screen is drawn on the stream output too.
+    rules.live = hl.window_rule({
+        name = "yt-stream-workspace-live",
+        enabled = S.live == true,
+        match = PREVIEW_MATCH,
+        idle_inhibit = "always",
+    })
     rules.layers = hl.layer_rule({
         name = "yt-stream-workspace-layers",
         match = { namespace = "negative:" .. S.stream_layers },
@@ -1030,6 +1039,7 @@ function M.begin()
         origins = {},
         entered = false,
         curtain = false,
+        live = false,
         corrections = 0,
         errors = 0,
     }
@@ -1160,6 +1170,20 @@ local function lost()
     notify("the stream output disappeared; run workspace-stream stop")
 end
 
+function M.set_live(on)
+    if not S then
+        return json({ ok = false })
+    end
+    S.live = on and true or false
+    if rules.live then
+        pcall(function()
+            rules.live:set_enabled(S.live)
+        end)
+    end
+    save()
+    return json({ ok = true, live = S.live })
+end
+
 function M.phase()
     return S and S.phase or "none"
 end
@@ -1178,6 +1202,7 @@ function M.status()
         origin_monitor = S.origin_monitor,
         entered = S.entered,
         curtain = S.curtain,
+        live = S.live,
         corrections = S.corrections or 0,
         last_correction = S.last_correction,
         trace = S.trace or {},

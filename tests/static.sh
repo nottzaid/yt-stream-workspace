@@ -7,9 +7,9 @@ bash -n "$ROOT/bin/workspace-stream"
 bash -n "$ROOT/install.sh"
 bash -n "$ROOT/uninstall.sh"
 bash -n "$ROOT/tests/cli.sh"
-"$ROOT/tests/lua.sh"
 bash -n "$ROOT/tests/install-smoke.sh"
 bash -n "$ROOT/tests/lua.sh"
+bash -n "$ROOT/tests/supervisor.sh"
 
 LUAC="$(command -v luac || command -v luac5.4 || true)"
 if [[ -n "$LUAC" ]]; then
@@ -32,11 +32,14 @@ if command -v shellcheck >/dev/null 2>&1; then
         "$ROOT/uninstall.sh" \
         "$ROOT/tests/cli.sh" \
         "$ROOT/tests/install-smoke.sh" \
-        "$ROOT/tests/lua.sh"
+        "$ROOT/tests/lua.sh" \
+        "$ROOT/tests/supervisor.sh"
 else
     printf 'shellcheck not installed; skipped\n'
 fi
 
 "$ROOT/tests/cli.sh"
+"$ROOT/tests/lua.sh"
+"$ROOT/tests/supervisor.sh"
 
 printf 'static checks passed\n'

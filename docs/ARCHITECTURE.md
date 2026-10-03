@@ -88,6 +88,38 @@ monitor. If that monitor is `YT-STREAM`, private workspaces cross the capture
 boundary. The windowed DMA-BUF mirror preserves monitor ownership and is the
 intentional tradeoff.
 
+## Supervisor contract
+
+`workspace-stream start` launches one detached supervisor per session
+(`workspace-stream _supervise`). It owns every long-running helper: the
+preview, the optional wallpaper, and wf-recorder while live. Commands arrive as
+`SEQ COMMAND [ARGUMENT]` lines on the mode-600 FIFO
+`$XDG_RUNTIME_DIR/yt-stream-workspace/control` and are answered in `reply`; the
+stream key travels only that way. `status` holds what the supervisor sees.
+
+- Each tick is one second and costs no process while idle. While live it reads
+  the recorder's TCP connection with `ss`: `bytes_acked` is delivery, not
+  buffering, so a network that stops accepting data is noticed after 10 s even
+  though the recorder is still writing into its socket buffer. (`/proc/PID/io`
+  cannot see this traffic: ffmpeg uses `send(2)`, which `wchar` does not count.)
+- An attempt counts as connected once 256 KiB are acknowledged and as accepted
+  after 10 s connected. Connected attempts that end are retried with 1-8 s
+  backoff indefinitely; three attempts in a row that are never accepted stop
+  delivery with an explanation, which is how a wrong key or a missing broadcast
+  shows up.
+- wf-recorder is stopped with TERM, which it handles like INT. Processes a
+  script starts in the background ignore INT, so TERM is the signal that works
+  for every helper.
+- WirePlumber remembers a capture stream's mute by application name. The
+  supervisor unmutes the recorder's own capture after every (re)connect, so one
+  muted recording cannot silence every later stream.
+- A crashing preview is restarted, up to five times a minute.
+- While live, the module enables an idle inhibitor on the preview window.
+- Waits use a private never-ready descriptor rather than the control FIFO, so
+  commands that arrive while the supervisor waits for wf-recorder to stop stay
+  queued. Errexit is off in this one long-lived process: every failure is
+  handled where it happens.
+
 ## Audio contract
 
 The prepared graph contains:

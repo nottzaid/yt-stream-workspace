@@ -108,18 +108,34 @@ tone, and requires H.264 at the configured dimensions plus non-silent AAC.
 Start and stop YouTube delivery:
 
 ```sh
-workspace-stream live       # prompts for the stream key without echo
+workspace-stream live       # asks for the stream key without echo
 workspace-stream stop-live  # leaves the prepared workspace intact
 workspace-stream stop       # restores workspace, output, audio, and processes
 ```
+
+`live` returns once YouTube is acknowledging the stream. From then on the
+session's supervisor keeps it going: if the connection drops or stalls (no data
+acknowledged for 10 seconds), it reconnects with a short backoff for as long as
+you stay live, and a desktop notification says so. A key YouTube refuses three
+times in a row stops with a clear message instead of retrying forever. To go
+live from a key binding, set `YTWS_STREAM_KEY_COMMAND` (for example a
+`secret-tool` or `pass` lookup) or `YTWS_STREAM_KEY_FILE` (mode 600). The key
+reaches the supervisor through a private pipe and is removed from every log;
+wf-recorder's own command line does contain it, which matters only on a machine
+shared with other users.
+
+While you are live the screen does not blank or lock: a blanked headless
+output freezes the stream, and a lock screen is drawn on the stream output too.
 
 `workspace-stream self-test` performs the entire local lifecycle on a temporary
 workspace: virtual output, test terminal, keyboard handoff, return to the
 physical monitor, RTMP, video, audio, and cleanup.
 
-`workspace-stream status` reports what the stream shows, where your input is,
-the layer surfaces on the stream output and whether each is hidden, and every
-correction the guard has made.
+`workspace-stream status` reports the YouTube state (live time, delivered
+bitrate, reconnects, or the reason it stopped), what the stream shows, where
+your input is, the layer surfaces on the stream output and whether each is
+hidden, and the corrections the guard has made. `status --json` gives the same
+for a bar widget.
 
 ## Preview performance
 

@@ -29,8 +29,19 @@ YTWS_AUDIO_BITRATE=128k
 # Local RTMP validation port used by `workspace-stream test`.
 YTWS_TEST_RTMP_PORT=19350
 
-# YouTube RTMPS ingest base URL. The stream key is prompted interactively.
+# YouTube RTMPS ingest base URL.
 YTWS_YOUTUBE_RTMPS_URL=rtmps://a.rtmps.youtube.com/live2
+
+# Where `workspace-stream live` gets the stream key. With neither set it asks
+# on the terminal. A command prints the key on its first line; a key file must
+# be readable only by you (chmod 600). Either one lets you go live from a key
+# binding.
+# YTWS_STREAM_KEY_COMMAND='secret-tool lookup service youtube-stream-key'
+# YTWS_STREAM_KEY_FILE="$HOME/.config/yt-stream-workspace/stream-key"
+
+# Desktop notifications when you go live, lose the connection, reconnect, or
+# YouTube refuses the stream. 0 turns them off.
+YTWS_NOTIFY=1
 
 # Optional wallpaper on the virtual output, if swaybg is installed.
 YTWS_WALLPAPER="$HOME/Pictures/background.jpg"

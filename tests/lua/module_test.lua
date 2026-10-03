@@ -390,6 +390,22 @@ test("a configuration reload re-arms the guard from saved state", function()
     assert_only_allowed_on_output()
 end)
 
+test("going live keeps the screen awake until delivery stops", function()
+    local ytws = desktop()
+    start(ytws)
+    local live_rule
+    for _, r in ipairs(F.state().rules.window) do
+        if r.spec.idle_inhibit then
+            live_rule = r
+        end
+    end
+    assert(live_rule and not live_rule.enabled, "idle inhibition must be off before going live")
+    ytws.set_live(true)
+    assert(live_rule.enabled)
+    ytws.set_live(false)
+    assert(not live_rule.enabled)
+end)
+
 test("status is valid JSON-shaped output", function()
     local ytws = desktop()
     start(ytws)
