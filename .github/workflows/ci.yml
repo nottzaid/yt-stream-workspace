@@ -9,8 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Install checkers
+        run: sudo apt-get update && sudo apt-get install -y shellcheck lua5.4
       - name: Static checks
         run: make test
       - name: Isolated install and uninstall

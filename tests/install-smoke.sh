@@ -25,8 +25,18 @@ test ! -e "$TMP/missing-config/yt-stream-workspace/config"
 
 mkdir -p "$HYPR_DIR"
 printf -- '-- test Hyprland config\n' >"$HYPR_DIR/hyprland.lua"
+cp "$HYPR_DIR/hyprland.lua" "$TMP/original-hyprland.lua"
 
 "$ROOT/install.sh" --hypr-source >"$TMP/install.log"
+
+# Whatever the installer appends must still be a valid Lua chunk; Hyprland
+# refuses to load a hyprland.lua with a syntax error.
+LUAC="$(command -v luac || command -v luac5.4 || true)"
+if [[ -n "$LUAC" ]]; then
+    "$LUAC" -p "$HYPR_DIR/hyprland.lua"
+else
+    printf 'luac not installed; hyprland.lua syntax check skipped\n'
+fi
 
 test -x "$XDG_BIN_HOME/workspace-stream"
 test -r "$CONFIG_DIR/config"
@@ -48,7 +58,7 @@ if grep -Fqx "$REQUIRE_LINE" "$HYPR_DIR/hyprland.lua"; then
     printf 'uninstall left its owned Hyprland require line behind\n' >&2
     exit 1
 fi
-grep -Fqx -e '-- test Hyprland config' "$HYPR_DIR/hyprland.lua"
+cmp "$TMP/original-hyprland.lua" "$HYPR_DIR/hyprland.lua"
 
 "$ROOT/install.sh" >"$TMP/reinstall.log"
 "$ROOT/uninstall.sh" --purge >"$TMP/purge.log"
@@ -80,5 +90,49 @@ cmp "$TMP/original-config" "$CONFIG_DIR/config"
 cmp "$TMP/original-module" "$HYPR_DIR/yt-stream-workspace.lua"
 grep -Fqx "$REQUIRE_LINE" "$HYPR_DIR/hyprland.lua"
 test "$(stat -c %a "$XDG_BIN_HOME/workspace-stream")" = 700
+
+rm -rf "$XDG_BIN_HOME" "$XDG_CONFIG_HOME"
+
+# A symlinked hyprland.lua (dotfiles managers) is edited through the link and
+# stays a link through install and uninstall.
+mkdir -p "$HYPR_DIR" "$TMP/dotfiles"
+printf -- '-- dotfiles config\n' >"$TMP/dotfiles/hyprland.lua"
+cp "$TMP/dotfiles/hyprland.lua" "$TMP/original-dotfiles.lua"
+ln -s "$TMP/dotfiles/hyprland.lua" "$HYPR_DIR/hyprland.lua"
+"$ROOT/install.sh" --hypr-source >"$TMP/symlink-install.log"
+test -L "$HYPR_DIR/hyprland.lua"
+grep -Fqx "$REQUIRE_LINE" "$TMP/dotfiles/hyprland.lua"
+"$ROOT/uninstall.sh" --purge >"$TMP/symlink-uninstall.log"
+test -L "$HYPR_DIR/hyprland.lua"
+cmp "$TMP/original-dotfiles.lua" "$TMP/dotfiles/hyprland.lua"
+rm -rf "$XDG_BIN_HOME" "$XDG_CONFIG_HOME"
+
+# A read-only hyprland.lua (for example in a Nix store) must be refused before
+# anything is installed.
+mkdir -p "$HYPR_DIR"
+printf -- '-- read-only config\n' >"$HYPR_DIR/hyprland.lua"
+chmod 444 "$HYPR_DIR/hyprland.lua"
+if "$ROOT/install.sh" --hypr-source >"$TMP/readonly.log" 2>&1; then
+    printf 'install unexpectedly edited a read-only hyprland.lua\n' >&2
+    exit 1
+fi
+grep -Fq 'not writable' "$TMP/readonly.log"
+test ! -e "$XDG_BIN_HOME/workspace-stream"
+chmod 644 "$HYPR_DIR/hyprland.lua"
+rm -rf "$XDG_BIN_HOME" "$XDG_CONFIG_HOME"
+
+# An installation made before the Lua migration owns a source line in
+# hyprland.conf and a .conf snippet; uninstall removes exactly those.
+mkdir -p "$HYPR_DIR" "$CONFIG_DIR/.install-state"
+LEGACY_LINE="source = $HYPR_DIR/yt-stream-workspace.conf"
+printf '# user conf\n' >"$HYPR_DIR/hyprland.conf"
+cp "$HYPR_DIR/hyprland.conf" "$TMP/original-hyprland.conf"
+printf '\n# yt-stream-workspace\n%s\n' "$LEGACY_LINE" >>"$HYPR_DIR/hyprland.conf"
+printf '%s\n' "$LEGACY_LINE" >"$CONFIG_DIR/hypr-source-added"
+printf 'bind = SUPER,F11,exec,true\n' >"$HYPR_DIR/yt-stream-workspace.conf"
+printf 'created\n' >"$CONFIG_DIR/.install-state/hypr-snippet"
+"$ROOT/uninstall.sh" >"$TMP/legacy-uninstall.log"
+cmp "$TMP/original-hyprland.conf" "$HYPR_DIR/hyprland.conf"
+test ! -e "$HYPR_DIR/yt-stream-workspace.conf"
 
 printf 'install smoke test passed\n'

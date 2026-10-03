@@ -49,9 +49,20 @@ if [[ "$INSTALL_DEPS" == 1 ]]; then
 fi
 
 HYPR_LUA="$HYPR_DIR/hyprland.lua"
+REQUIRE_LINE='require("yt-stream-workspace")'
+REQUIRE_COMMENT='-- yt-stream-workspace'
 if [[ "$HYPR_SOURCE" == 1 ]]; then
     if [[ ! -e "$HYPR_LUA" ]]; then
         printf 'install.sh: cannot use --hypr-source; missing %s\n' "$HYPR_LUA" >&2
+        exit 1
+    fi
+    # hyprland.lua is often a symlink into a dotfiles tree or a read-only
+    # store; edit the file it resolves to, and refuse before installing
+    # anything when that file cannot be edited.
+    HYPR_LUA_TARGET="$(readlink -f -- "$HYPR_LUA")"
+    if ! grep -Fqx "$REQUIRE_LINE" "$HYPR_LUA_TARGET" && [[ ! -w "$HYPR_LUA_TARGET" ]]; then
+        printf 'install.sh: cannot use --hypr-source; %s is not writable\n' "$HYPR_LUA_TARGET" >&2
+        printf 'Add this line to your Hyprland config yourself: %s\n' "$REQUIRE_LINE" >&2
         exit 1
     fi
 fi
@@ -122,15 +133,14 @@ else
 fi
 
 if [[ "$HYPR_SOURCE" == 1 ]]; then
-    REQUIRE_LINE='require("yt-stream-workspace")'
-    if grep -Fqx "$REQUIRE_LINE" "$HYPR_LUA"; then
+    if grep -Fqx "$REQUIRE_LINE" "$HYPR_LUA_TARGET"; then
         printf 'Hyprland require line already present in %s\n' "$HYPR_LUA"
     else
-        BACKUP="$HYPR_LUA.yt-stream-workspace.bak.$(date +%Y%m%d-%H%M%S)"
-        cp "$HYPR_LUA" "$BACKUP"
-        printf '\n# yt-stream-workspace\n%s\n' "$REQUIRE_LINE" >>"$HYPR_LUA"
+        BACKUP="$HYPR_LUA_TARGET.yt-stream-workspace.bak.$(date +%Y%m%d-%H%M%S)"
+        cp -- "$HYPR_LUA_TARGET" "$BACKUP"
+        printf '\n%s\n%s\n' "$REQUIRE_COMMENT" "$REQUIRE_LINE" >>"$HYPR_LUA_TARGET"
         printf '%s\n' "$REQUIRE_LINE" >"$HYPR_SOURCE_MARKER"
-        printf 'Added Hyprland require line to %s\n' "$HYPR_LUA"
+        printf 'Added Hyprland require line to %s\n' "$HYPR_LUA_TARGET"
         printf 'Backup: %s\n' "$BACKUP"
     fi
 fi
