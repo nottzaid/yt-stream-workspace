@@ -31,18 +31,72 @@ esac
 
 printf 'This removes only files installed by yt-stream-workspace.\n'
 
-HYPR_LUA="$HYPR_DIR/hyprland.lua"
-if [[ -e "$HYPR_SOURCE_MARKER" && -f "$HYPR_LUA" ]]; then
-    BACKUP="$HYPR_LUA.yt-stream-workspace-uninstall.bak.$(date +%Y%m%d-%H%M%S)"
-    cp "$HYPR_LUA" "$BACKUP"
-    # Remove the require line this installer owns, plus any source line left by
-    # an install made before the Hyprland 0.55 Lua migration.
-    sed -i \
-        -e '/^# yt-stream-workspace$/d' \
-        -e '/^require("yt-stream-workspace")$/d' \
-        -e '/^source = .*yt-stream-workspace.*\.conf$/d' \
-        "$HYPR_LUA"
-    printf 'Removed the installer-owned Hyprland require line. Backup: %s\n' "$BACKUP"
+# Remove the line this installer appended, plus the comment and blank line it
+# wrote above it. The file is rewritten through its resolved path so a
+# symlinked config stays a symlink; a read-only target is reported, never
+# forced.
+remove_owned_line() {
+    local file="$1"
+    local owned="$2"
+    local target backup temporary line
+    local -a kept=()
+
+    target="$(readlink -f -- "$file")"
+    if ! grep -Fqx -- "$owned" "$target"; then
+        return 0
+    fi
+    if [[ ! -w "$target" || ! -w "$(dirname -- "$target")" ]]; then
+        printf 'uninstall.sh: %s is not writable; remove this line yourself: %s\n' \
+            "$target" "$owned" >&2
+        return 1
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$owned" ]]; then
+            if (( ${#kept[@]} )) &&
+               [[ "${kept[-1]}" == '-- yt-stream-workspace' ||
+                  "${kept[-1]}" == '# yt-stream-workspace' ]]; then
+                unset 'kept[-1]'
+                # The installer also wrote the blank separator line.
+                if (( ${#kept[@]} )) && [[ -z "${kept[-1]}" ]]; then
+                    unset 'kept[-1]'
+                fi
+            fi
+            continue
+        fi
+        kept+=("$line")
+    done <"$target"
+
+    backup="$target.yt-stream-workspace-uninstall.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -- "$target" "$backup"
+    temporary="$(mktemp "$(dirname -- "$target")/.yt-stream-workspace.XXXXXX")"
+    if (( ${#kept[@]} )); then
+        printf '%s\n' "${kept[@]}" >"$temporary"
+    fi
+    chmod --reference="$target" "$temporary"
+    mv -- "$temporary" "$target"
+    printf 'Removed the installer-owned Hyprland line from %s. Backup: %s\n' \
+        "$target" "$backup"
+}
+
+if [[ -e "$HYPR_SOURCE_MARKER" ]]; then
+    owned_line="$(sed -n '1p' "$HYPR_SOURCE_MARKER")"
+    case "$owned_line" in
+    "")
+        # Empty markers were written by versions before 2026-07.
+        owned_line='source = ~/.config/hypr/yt-stream-workspace.conf'
+        owned_file="$HYPR_DIR/hyprland.conf"
+        ;;
+    source\ =*)
+        owned_file="$HYPR_DIR/hyprland.conf"
+        ;;
+    *)
+        owned_file="$HYPR_DIR/hyprland.lua"
+        ;;
+    esac
+    if [[ -f "$owned_file" ]]; then
+        remove_owned_line "$owned_file" "$owned_line" || exit 1
+    fi
 fi
 
 restore_or_remove() {
@@ -84,9 +138,14 @@ restore_or_remove() {
 restore_or_remove \
     "$BIN_DIR/workspace-stream" "$BIN_MARKER" "$BACKUP_DIR/workspace-stream" \
     "workspace-stream executable"
+managed_module="$HYPR_DIR/yt-stream-workspace.lua"
+if [[ ! -e "$managed_module" && -e "$HYPR_DIR/yt-stream-workspace.conf" ]]; then
+    # Installs made before the Lua migration managed a .conf snippet.
+    managed_module="$HYPR_DIR/yt-stream-workspace.conf"
+fi
 restore_or_remove \
-    "$HYPR_DIR/yt-stream-workspace.lua" "$SNIPPET_MARKER" \
-    "$BACKUP_DIR/yt-stream-workspace.lua" "Hyprland module"
+    "$managed_module" "$SNIPPET_MARKER" \
+    "$BACKUP_DIR/${managed_module##*/}" "Hyprland module"
 
 rm -f "$HYPR_SOURCE_MARKER"
 

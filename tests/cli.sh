@@ -28,6 +28,10 @@ expect_config_error 'YTWS_VIDEO_GOP=241' 'YTWS_VIDEO_GOP must not exceed four se
 expect_config_error 'YTWS_OUTPUT=bad,rule' 'YTWS_OUTPUT may contain only'
 expect_config_error 'YTWS_MIX_SINK="bad sink"' 'YTWS_MIX_SINK may contain only'
 expect_config_error 'YTWS_MIRROR_BACKEND=unknown' 'YTWS_MIRROR_BACKEND is not a supported'
+expect_config_error 'YTWS_STREAM_LAYERS="("' 'YTWS_STREAM_LAYERS must be a regular expression'
+expect_config_error 'YTWS_PRIVATE_WINDOWS="a["' 'YTWS_PRIVATE_WINDOWS must be a regular expression'
+expect_config_error 'YTWS_PREVIEW_MONITOR="two words"' 'YTWS_PREVIEW_MONITOR must be a Hyprland monitor name'
+expect_config_error 'YTWS_NOTIFY=yes' 'YTWS_NOTIFY must be 0 or 1'
 
 XDG_STATE_HOME="$TMP/state" "$ROOT/bin/workspace-stream" logs >"$TMP/logs"
 grep -Fqx "$TMP/state/yt-stream-workspace" "$TMP/logs"

@@ -8,14 +8,16 @@ stream workspace → headless output YT-STREAM → wf-recorder → YouTube
                          └→ wl-mirror preview on the physical monitor
 ```
 
-The visual boundary is one argument: `wf-recorder -o YT-STREAM`. Capture follows
-that output, not the workspace where the recorder process was launched. The
-wrapper always names it explicitly.
+Viewers see exactly one Hyprland output, `YT-STREAM`. While a session runs,
+Hyprland itself keeps that boundary: the `yt-stream-workspace.lua` module reacts
+inside the compositor's own event handlers, before a frame can be rendered or
+captured, so no other workspace and no special workspace is ever shown there,
+whichever key, script, or monitor change tries. Bars, notifications, launchers,
+and other layer surfaces on the stream output are painted black in the capture
+unless their namespace is allowed, and windows of password managers are always
+painted black.
 
-This is practical visual isolation, not a sandbox. Desktop and microphone audio
-are mixed globally by default; notifications, pinned windows, and overlays
-rendered on `YT-STREAM` can appear; raw Hyprland commands can bypass the safe
-workspace bindings.
+Desktop and microphone audio are still mixed globally.
 
 ## Install
 
@@ -46,9 +48,11 @@ Installation writes:
 
 With `--hypr-source`, it backs up `hyprland.lua` (Hyprland 0.55+ replaced the
 hyprlang `.conf` format with Lua), appends `require("yt-stream-workspace")`
-only when absent, and records ownership so `./uninstall.sh` removes only a line
-this installation added. Generated bindings use the actual `XDG_BIN_HOME`, and
-the require line is path-independent; non-default XDG paths are supported.
+only when absent, and records ownership so `./uninstall.sh` removes only the
+lines this installation added. A symlinked `hyprland.lua` is edited through the
+link; a read-only one is refused before anything is installed. The module calls
+no external command for its bindings, so non-default XDG paths need nothing
+special.
 
 The installer records whether it created or replaced each managed file.
 Replaced executables and modules are backed up and restored by uninstall. A
@@ -68,22 +72,29 @@ Prepare workspace 3:
 workspace-stream start 3
 ```
 
-This moves workspace 3 to a `1920x1080@60` headless output at scale 1.5, opens
-a local mirror, selects a working VAAPI H.264 render node, and creates the audio
-mix. The selected workspace is explicitly activated on the virtual output;
-known private workspaces are verified back on their original monitors even if
-Hyprland tries to restore them to a same-named output from an earlier session.
+This moves workspace 3 to a `1920x1080@60` headless output at scale 1.5, below
+and apart from your monitors so the pointer never wanders onto it, selects a
+working VAAPI H.264 render node, and creates the audio mix. A fullscreen preview
+of the stream lives on its own workspace, `stream-preview`, on the monitor
+workspace 3 came from. If you were working in workspace 3, you keep working in
+it.
 
-Use `Super+F11` to control the stream workspace and `Super+F12` to return to the
-physical monitor, or run `workspace-stream enter` and `workspace-stream leave`.
-For ordinary navigation, replace direct Hyprland bindings with the wrapper so
-the stream workspace stays pinned:
+Input is in the stream exactly when the stream output has focus, and the
+physical monitor then shows the preview:
 
-```ini
-bind = SUPER,1,exec,~/.local/bin/workspace-stream workspace 1
-bind = SUPER,2,exec,~/.local/bin/workspace-stream workspace 2
-# continue through workspace 10
-```
+- `Super+F11` (`workspace-stream enter`) works in the stream; the pointer keeps
+  its place on the preview.
+- `Super+F12` (`workspace-stream leave`) returns to the workspace you came from.
+- Your ordinary workspace keys work too: the stream workspace's key enters,
+  any other key leaves, and a new workspace opened from the stream appears on
+  the physical monitor.
+- `Super+F10` (`workspace-stream curtain`) raises the curtain: viewers
+  instantly see an empty workspace and hear nothing, while the stream
+  workspace moves to your monitor so you can fix whatever needed hiding.
+  Press it again to resume.
+
+Rebind the keys after the require line, for example
+`YTWS.bind({ enter = "SUPER + F9", curtain = false })`.
 
 Validate locally before publishing:
 
@@ -97,14 +108,34 @@ tone, and requires H.264 at the configured dimensions plus non-silent AAC.
 Start and stop YouTube delivery:
 
 ```sh
-workspace-stream live       # prompts for the stream key without echo
+workspace-stream live       # asks for the stream key without echo
 workspace-stream stop-live  # leaves the prepared workspace intact
 workspace-stream stop       # restores workspace, output, audio, and processes
 ```
 
+`live` returns once YouTube is acknowledging the stream. From then on the
+session's supervisor keeps it going: if the connection drops or stalls (no data
+acknowledged for 10 seconds), it reconnects with a short backoff for as long as
+you stay live, and a desktop notification says so. A key YouTube refuses three
+times in a row stops with a clear message instead of retrying forever. To go
+live from a key binding, set `YTWS_STREAM_KEY_COMMAND` (for example a
+`secret-tool` or `pass` lookup) or `YTWS_STREAM_KEY_FILE` (mode 600). The key
+reaches the supervisor through a private pipe and is removed from every log;
+wf-recorder's own command line does contain it, which matters only on a machine
+shared with other users.
+
+While you are live the screen does not blank or lock: a blanked headless
+output freezes the stream, and a lock screen is drawn on the stream output too.
+
 `workspace-stream self-test` performs the entire local lifecycle on a temporary
 workspace: virtual output, test terminal, keyboard handoff, return to the
 physical monitor, RTMP, video, audio, and cleanup.
+
+`workspace-stream status` reports the YouTube state (live time, delivered
+bitrate, reconnects, or the reason it stopped), what the stream shows, where
+your input is, the layer surfaces on the stream output and whether each is
+hidden, and the corrections the guard has made. `status --json` gives the same
+for a bar widget.
 
 ## Preview performance
 
