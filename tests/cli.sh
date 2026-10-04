@@ -35,6 +35,32 @@ expect_config_error 'YTWS_NOTIFY=yes' 'YTWS_NOTIFY must be 0 or 1'
 expect_config_error 'YTWS_DESKTOP_AUDIO="two words"' 'YTWS_DESKTOP_AUDIO must be default, none, or a PipeWire sink name'
 expect_config_error 'YTWS_MIC=node:port' 'YTWS_MIC must be default, none, or a PipeWire source name'
 
+# Without a reachable Hyprland, hyprctl complains on stdout and exits 1; the CLI
+# must say that, not mistake the complaint for a module protocol.
+mkdir -p "$TMP/bin" "$TMP/run/yt-stream-workspace"
+cat >"$TMP/bin/hyprctl" <<'EOF'
+#!/usr/bin/env bash
+printf 'HYPRLAND_INSTANCE_SIGNATURE not set! (is hyprland running?)\n\n'
+exit 1
+EOF
+chmod +x "$TMP/bin/hyprctl"
+printf 'WORKSPACE=2\n' >"$TMP/run/yt-stream-workspace/state"
+
+expect_hyprland_error() {
+    local expected="$1"
+    shift
+    if env "$@" PATH="$TMP/bin:$PATH" XDG_RUNTIME_DIR="$TMP/run" \
+        "$ROOT/bin/workspace-stream" curtain on >"$TMP/stdout" 2>"$TMP/stderr"; then
+        printf 'curtain unexpectedly worked without Hyprland\n' >&2
+        exit 1
+    fi
+    grep -Fq "$expected" "$TMP/stderr"
+    ! grep -Fq 'protocol' "$TMP/stderr"
+}
+
+expect_hyprland_error 'HYPRLAND_INSTANCE_SIGNATURE is not set' -u HYPRLAND_INSTANCE_SIGNATURE
+expect_hyprland_error 'cannot reach Hyprland' HYPRLAND_INSTANCE_SIGNATURE=gone
+
 XDG_STATE_HOME="$TMP/state" "$ROOT/bin/workspace-stream" logs >"$TMP/logs"
 grep -Fqx "$TMP/state/yt-stream-workspace" "$TMP/logs"
 grep -Fq 'no diagnostic logs have been written' "$TMP/logs"

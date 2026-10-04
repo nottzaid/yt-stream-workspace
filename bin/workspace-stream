@@ -224,8 +224,15 @@ hypr_call() {
     printf '%s\n' "$result"
 }
 
+# hyprctl reports "cannot connect" on stdout, so only a number is an answer.
 module_protocol() {
-    hyprctl repl 'return YTWS and YTWS.protocol or 0' 2>/dev/null || printf '0\n'
+    local protocol
+    protocol="$(hyprctl repl 'return YTWS and YTWS.protocol or 0' 2>/dev/null)" || protocol=""
+    if [[ "$protocol" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$protocol"
+    else
+        printf '0\n'
+    fi
 }
 
 module_path() {
@@ -238,7 +245,15 @@ module_path() {
     return 1
 }
 
+require_hyprland() {
+    [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] ||
+        die "HYPRLAND_INSTANCE_SIGNATURE is not set; run this from inside the Hyprland session"
+    hyprctl version >/dev/null 2>&1 ||
+        die "cannot reach Hyprland (instance $HYPRLAND_INSTANCE_SIGNATURE); is it running?"
+}
+
 ensure_module() {
+    require_hyprland
     local protocol
     protocol="$(module_protocol)"
     if [[ "$protocol" == "$PROTOCOL" ]]; then
@@ -709,6 +724,9 @@ start_session() {
     require_commands hyprctl jq pactl pw-link ffmpeg ss setsid
     resolve_recorder
     resolve_preview
+    # Without a signature every state file would look like an earlier
+    # instance's, and a live session would be discarded.
+    require_hyprland
     discard_stale_session
     ensure_module
     output_exists && die "Hyprland output '$OUTPUT' already exists"
