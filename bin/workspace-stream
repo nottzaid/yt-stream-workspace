@@ -245,9 +245,28 @@ module_path() {
     return 1
 }
 
+# A shell that did not start inside Hyprland (ssh, a service) has neither the
+# instance signature nor the Wayland socket name. Take them from the running
+# instance; with several it would be a guess. A signature taken here brings its
+# own socket: a WAYLAND_DISPLAY from elsewhere (waypipe) is another compositor.
+adopt_hyprland_instance() {
+    [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" || -z "${WAYLAND_DISPLAY:-}" ]] || return 0
+    command -v hyprctl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 0
+    local instances picked signature socket
+    instances="$(hyprctl instances -j 2>/dev/null)" || return 0
+    picked="$(jq -r --arg signature "${HYPRLAND_INSTANCE_SIGNATURE:-}" '
+        [.[] | select($signature == "" or .instance == $signature)]
+        | if length == 1 then .[0] | "\(.instance)\t\(.wl_socket // "")" else empty end
+    ' <<<"$instances" 2>/dev/null)" || return 0
+    [[ -n "$picked" ]] || return 0
+    IFS=$'\t' read -r signature socket <<<"$picked"
+    [[ -z "$socket" ]] || export WAYLAND_DISPLAY="$socket"
+    export HYPRLAND_INSTANCE_SIGNATURE="$signature"
+}
+
 require_hyprland() {
     [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] ||
-        die "HYPRLAND_INSTANCE_SIGNATURE is not set; run this from inside the Hyprland session"
+        die "HYPRLAND_INSTANCE_SIGNATURE is not set and there is not exactly one running Hyprland to use; run this inside the Hyprland session"
     hyprctl version >/dev/null 2>&1 ||
         die "cannot reach Hyprland (instance $HYPRLAND_INSTANCE_SIGNATURE); is it running?"
 }
@@ -1790,6 +1809,8 @@ run_self_test() {
     note "your own windows were left where they were"
     note "all automated integration checks passed"
 }
+
+adopt_hyprland_instance
 
 case "${1:-}" in
 start)

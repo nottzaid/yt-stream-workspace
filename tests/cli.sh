@@ -61,6 +61,66 @@ expect_hyprland_error() {
 expect_hyprland_error 'HYPRLAND_INSTANCE_SIGNATURE is not set' -u HYPRLAND_INSTANCE_SIGNATURE
 expect_hyprland_error 'cannot reach Hyprland' HYPRLAND_INSTANCE_SIGNATURE=gone
 
+# A shell that did not start inside Hyprland (ssh, a service) has no instance
+# signature or Wayland socket; the CLI takes both from the one running instance.
+mkdir -p "$TMP/live"
+cat >"$TMP/live/hyprctl" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+instances) cat "$FAKE_INSTANCES" ;;
+version) ;;
+repl)
+    printf '%s %s\n' "${HYPRLAND_INSTANCE_SIGNATURE:-}" "${WAYLAND_DISPLAY:-}" >>"$FAKE_SEEN"
+    if [[ "$2" == *curtain* ]]; then
+        printf '{"ok":true,"curtain":true}\n'
+    else
+        printf '1\n'
+    fi
+    ;;
+esac
+EOF
+chmod +x "$TMP/live/hyprctl"
+
+one='[{"instance":"abc_1","pid":1,"wl_socket":"wayland-9"}]'
+two='[{"instance":"abc_1","pid":1,"wl_socket":"wayland-9"},{"instance":"def_2","pid":2,"wl_socket":"wayland-8"}]'
+
+expect_seen() {
+    [[ "$(sort -u "$TMP/seen")" == "$1" ]]
+}
+
+run_curtain() {
+    printf '%s\n' "$1" >"$TMP/instances"
+    shift
+    : >"$TMP/seen"
+    env "$@" PATH="$TMP/live:$PATH" XDG_RUNTIME_DIR="$TMP/run" \
+        FAKE_INSTANCES="$TMP/instances" FAKE_SEEN="$TMP/seen" \
+        "$ROOT/bin/workspace-stream" curtain on >"$TMP/stdout" 2>"$TMP/stderr"
+}
+
+run_curtain "$one" -u HYPRLAND_INSTANCE_SIGNATURE -u WAYLAND_DISPLAY
+grep -Fq 'curtain up' "$TMP/stdout"
+expect_seen 'abc_1 wayland-9'
+
+# A signature taken from the instance brings its socket: another WAYLAND_DISPLAY
+# (waypipe) would put hyprctl and the preview on different compositors.
+run_curtain "$one" -u HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY=wayland-0
+expect_seen 'abc_1 wayland-9'
+
+# A shell that already has both is left alone.
+run_curtain "$one" HYPRLAND_INSTANCE_SIGNATURE=abc_1 WAYLAND_DISPLAY=wayland-0
+expect_seen 'abc_1 wayland-0'
+
+# A signature the shell already has picks its instance among several.
+run_curtain "$two" -u WAYLAND_DISPLAY HYPRLAND_INSTANCE_SIGNATURE=def_2
+expect_seen 'def_2 wayland-8'
+
+# With several instances and no signature, guessing could stream the wrong one.
+if run_curtain "$two" -u HYPRLAND_INSTANCE_SIGNATURE -u WAYLAND_DISPLAY; then
+    printf 'curtain guessed between two Hyprland instances\n' >&2
+    exit 1
+fi
+grep -Fq 'not exactly one running Hyprland' "$TMP/stderr"
+
 XDG_STATE_HOME="$TMP/state" "$ROOT/bin/workspace-stream" logs >"$TMP/logs"
 grep -Fqx "$TMP/state/yt-stream-workspace" "$TMP/logs"
 grep -Fq 'no diagnostic logs have been written' "$TMP/logs"
