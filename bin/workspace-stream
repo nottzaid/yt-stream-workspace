@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # workspace-stream: stream one Hyprland workspace to YouTube while every other
 # workspace stays private. The compositor side of the boundary lives in
-# hyprland/yt-stream-workspace.lua; see docs/ARCHITECTURE.md.
+# hyprland/yt-stream-workspace.lua; README.md explains the design.
 set -Eeuo pipefail
 
 PROTOCOL=1
@@ -42,7 +42,15 @@ STREAM_LAYERS="${YTWS_STREAM_LAYERS:-.*wallpaper.*|hyprpaper|swww-daemon|mpvpape
 PRIVATE_WINDOWS="${YTWS_PRIVATE_WINDOWS-org\.keepassxc\.KeePassXC|KeePassXC|1[Pp]assword|[Bb]itwarden|com\.bitwarden\.desktop|gcr-prompter|org\.gnome\.seahorse\.Application}"
 
 MIX_SINK="${YTWS_MIX_SINK:-yt_stream_mix}"
-OUTPUT_SINK="${YTWS_OUTPUT_SINK:-yt_stream_output}"
+# What viewers hear: the default output device and the default microphone,
+# followed when either changes. "none" leaves one out; a node name pins one.
+DESKTOP_AUDIO="${YTWS_DESKTOP_AUDIO:-default}"
+MIC="${YTWS_MIC:-default}"
+# Helpers built by native/build.sh, used when present: the patched recorder
+# and the copy-free preview. Otherwise wf-recorder and wl-mirror from PATH.
+NATIVE_BIN="${XDG_DATA_HOME:-$HOME/.local/share}/yt-stream-workspace/bin"
+CONFIGURED_RECORDER="${YTWS_RECORDER:-}"
+CONFIGURED_PREVIEW="${YTWS_PREVIEW:-}"
 RUN_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/yt-stream-workspace"
 STATE_FILE="$RUN_DIR/state"
 SESSION_FILE="$RUN_DIR/session.lua"
@@ -120,8 +128,10 @@ validate_config() {
         die "YTWS_OUTPUT may contain only letters, numbers, dot, underscore, and hyphen"
     [[ "$MIX_SINK" =~ ^[A-Za-z0-9._-]+$ ]] ||
         die "YTWS_MIX_SINK may contain only letters, numbers, dot, underscore, and hyphen"
-    [[ "$OUTPUT_SINK" =~ ^[A-Za-z0-9._-]+$ ]] ||
-        die "YTWS_OUTPUT_SINK may contain only letters, numbers, dot, underscore, and hyphen"
+    [[ "$DESKTOP_AUDIO" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "YTWS_DESKTOP_AUDIO must be default, none, or a PipeWire sink name"
+    [[ "$MIC" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "YTWS_MIC must be default, none, or a PipeWire source name"
     [[ -z "$PREVIEW_MONITOR" || "$PREVIEW_MONITOR" =~ ^[A-Za-z0-9._-]+$ ]] ||
         die "YTWS_PREVIEW_MONITOR must be a Hyprland monitor name"
     { [[ -n "$STREAM_LAYERS" && "$STREAM_LAYERS" != *[[:cntrl:]]* ]] &&
@@ -327,7 +337,11 @@ write_state() {
         printf 'TEST_RTMP_PORT=%q\n' "$TEST_RTMP_PORT"
         printf 'YOUTUBE_RTMPS_URL=%q\n' "$YOUTUBE_RTMPS_URL"
         printf 'MIX_SINK=%q\n' "$MIX_SINK"
-        printf 'OUTPUT_SINK=%q\n' "$OUTPUT_SINK"
+        printf 'DESKTOP_AUDIO=%q\n' "$DESKTOP_AUDIO"
+        printf 'MIC=%q\n' "$MIC"
+        printf 'RECORDER=%q\n' "${RECORDER:-}"
+        printf 'RECORDER_PATCHED=%q\n' "${RECORDER_PATCHED:-0}"
+        printf 'PREVIEW_COMMAND=%q\n' "${PREVIEW_COMMAND:-}"
         printf 'MIRROR_BACKEND=%q\n' "$MIRROR_BACKEND"
         printf 'WALLPAPER=%q\n' "$WALLPAPER"
         printf 'NOTIFY=%q\n' "$NOTIFY"
@@ -335,12 +349,7 @@ write_state() {
         printf 'SIGNATURE=%q\n' "${SIGNATURE:-}"
         printf 'WORKSPACE=%q\n' "${WORKSPACE:-}"
         printf 'PREVIEW_ON=%q\n' "${PREVIEW_ON:-}"
-        printf 'ORIGINAL_SINK=%q\n' "${ORIGINAL_SINK:-}"
-        printf 'ORIGINAL_SOURCE=%q\n' "${ORIGINAL_SOURCE:-}"
-        printf 'PREEXISTING_INPUTS=%q\n' "${PREEXISTING_INPUTS:-}"
         printf 'NULL_MODULE=%q\n' "${NULL_MODULE:-}"
-        printf 'COMBINE_MODULE=%q\n' "${COMBINE_MODULE:-}"
-        printf 'LOOPBACK_MODULE=%q\n' "${LOOPBACK_MODULE:-}"
         printf 'SUPERVISOR_PID=%q\n' "${SUPERVISOR_PID:-}"
         printf 'VAAPI_DEVICE=%q\n' "${VAAPI_DEVICE:-}"
     } >"$STATE_FILE"
@@ -387,48 +396,32 @@ detect_vaapi_device() {
 }
 
 # --- audio ------------------------------------------------------------------
+#
+# Viewers hear the null sink $MIX_SINK. While something is recorded, the
+# output device's monitor and the microphone are linked into it with plain
+# PipeWire links: nothing is rerouted, the user's own audio is untouched, and
+# between recordings there is no link at all, so the microphone stays closed
+# and no sound is processed for the stream.
 
 audio_start() {
-    local input
-
-    ORIGINAL_SINK="$(pactl get-default-sink)"
-    ORIGINAL_SOURCE="$(pactl get-default-source)"
-    PREEXISTING_INPUTS="$(
-        pactl list short sink-inputs | awk '{print $1}' | paste -sd' ' -
-    )"
-
     NULL_MODULE="$(
         pactl load-module module-null-sink \
             sink_name="$MIX_SINK" \
             sink_properties=device.description=YouTube_Stream_Mix \
             rate=48000 channels=2
     )"
-    COMBINE_MODULE="$(
-        pactl load-module module-combine-sink \
-            sink_name="$OUTPUT_SINK" \
-            sink_properties=device.description=YouTube_Stream_Output \
-            sinks="$ORIGINAL_SINK,$MIX_SINK" \
-            rate=48000 channels=2
-    )"
-    LOOPBACK_MODULE="$(
-        pactl load-module module-loopback \
-            source="$ORIGINAL_SOURCE" sink="$MIX_SINK" latency_msec=20
-    )"
-
-    pactl set-default-sink "$OUTPUT_SINK"
-    for input in $PREEXISTING_INPUTS; do
-        pactl move-sink-input "$input" "$OUTPUT_SINK" 2>/dev/null || true
-    done
 }
 
+# Unloading the mix also removes every link into it.
 audio_stop() {
-    local stream_sink_id input
+    local stream_sink_id input module
 
+    # Sessions from before the link-based mix moved the default sink.
     if [[ -n "${ORIGINAL_SINK:-}" ]]; then
         pactl set-default-sink "$ORIGINAL_SINK" 2>/dev/null || true
         stream_sink_id="$(
             pactl list short sinks 2>/dev/null |
-                awk -v name="$OUTPUT_SINK" '$2 == name {print $1; exit}'
+                awk -v name="${OUTPUT_SINK:-yt_stream_output}" '$2 == name {print $1; exit}'
         )"
         if [[ -n "$stream_sink_id" ]]; then
             while read -r input; do
@@ -441,22 +434,152 @@ audio_stop() {
         fi
     fi
 
-    if [[ -n "${LOOPBACK_MODULE:-}" ]]; then
-        pactl unload-module "$LOOPBACK_MODULE" 2>/dev/null || true
+    for module in "${LOOPBACK_MODULE:-}" "${COMBINE_MODULE:-}" "${NULL_MODULE:-}"; do
+        [[ -n "$module" ]] || continue
+        pactl unload-module "$module" 2>/dev/null || true
+    done
+}
+
+# The PipeWire node a desktop-audio or microphone setting names right now.
+audio_node() {
+    local setting="$1" kind="$2" node
+    case "$setting" in
+    none) return 0 ;;
+    default) node="$(pactl "get-default-$kind" 2>/dev/null)" || return 0 ;;
+    *) node="$setting" ;;
+    esac
+    # A sink's monitor, in PulseAudio spelling, is the sink's monitor ports.
+    node="${node%.monitor}"
+    [[ -n "$node" && "$node" != "$MIX_SINK" ]] && printf '%s\n' "$node"
+    return 0
+}
+
+# "OUT<TAB>IN" links that feed NODE into the mix: matching channels, a mono
+# node into both sides, anything else by position. Reads the caller's
+# OUTPUT_PORTS; fails if the node has no ports.
+audio_pairs() {
+    local node="$1" port matched=0
+    local -a ports=()
+    for port in "${OUTPUT_PORTS[@]}"; do
+        [[ "$port" == "$node:"* ]] && ports+=("$port")
+    done
+    case "${#ports[@]}" in
+    0) return 1 ;;
+    1)
+        printf '%s\t%s\n' "${ports[0]}" "$MIX_SINK:playback_FL" "${ports[0]}" "$MIX_SINK:playback_FR"
+        return 0
+        ;;
+    esac
+    for port in "${ports[@]}"; do
+        case "${port##*_}" in
+        FL|FR)
+            printf '%s\t%s\n' "$port" "$MIX_SINK:playback_${port##*_}"
+            matched=1
+            ;;
+        esac
+    done
+    (( matched )) ||
+        printf '%s\t%s\n' "${ports[0]}" "$MIX_SINK:playback_FL" "${ports[1]}" "$MIX_SINK:playback_FR"
+}
+
+declare -A AUDIO_LINKS=()
+AUDIO_DESCRIPTION=""
+
+# Link what viewers should hear into the mix and drop the links this process
+# made that are no longer wanted. Safe to repeat: existing links stay.
+audio_link_sync() {
+    local -A want=()
+    local -a OUTPUT_PORTS=() parts=()
+    local kind setting node pair pairs
+    mapfile -t OUTPUT_PORTS < <(pw-link -o 2>/dev/null)
+    for kind in desktop microphone; do
+        if [[ "$kind" == desktop ]]; then
+            setting="$DESKTOP_AUDIO"
+            node="$(audio_node "$DESKTOP_AUDIO" sink)"
+        else
+            setting="$MIC"
+            node="$(audio_node "$MIC" source)"
+        fi
+        if [[ -z "$node" && "$setting" == none ]]; then
+            parts+=("$kind off")
+        elif [[ -z "$node" ]]; then
+            parts+=("$kind unavailable")
+        elif pairs="$(audio_pairs "$node")"; then
+            while IFS= read -r pair; do want[$pair]=1; done <<<"$pairs"
+            parts+=("$kind $node")
+        else
+            parts+=("$kind $node (not found)")
+        fi
+    done
+    AUDIO_DESCRIPTION="${parts[0]}, ${parts[1]}"
+
+    for pair in "${!AUDIO_LINKS[@]}"; do
+        [[ -n "${want[$pair]:-}" ]] && continue
+        pw-link -d "${pair%%$'\t'*}" "${pair#*$'\t'}" >/dev/null 2>&1 || true
+        unset 'AUDIO_LINKS[$pair]'
+    done
+    for pair in "${!want[@]}"; do
+        # Fails harmlessly for a link that exists already.
+        pw-link "${pair%%$'\t'*}" "${pair#*$'\t'}" >/dev/null 2>&1 || true
+        AUDIO_LINKS[$pair]=1
+    done
+}
+
+audio_unlink_all() {
+    local pair
+    for pair in "${!AUDIO_LINKS[@]}"; do
+        pw-link -d "${pair%%$'\t'*}" "${pair#*$'\t'}" >/dev/null 2>&1 || true
+    done
+    AUDIO_LINKS=()
+}
+
+# --- recorder ---------------------------------------------------------------
+
+# Which wf-recorder to run, and whether it carries recorder/patches.
+resolve_recorder() {
+    RECORDER="$CONFIGURED_RECORDER"
+    if [[ -z "$RECORDER" && -x "$NATIVE_BIN/wf-recorder" ]]; then
+        RECORDER="$NATIVE_BIN/wf-recorder"
     fi
-    if [[ -n "${COMBINE_MODULE:-}" ]]; then
-        pactl unload-module "$COMBINE_MODULE" 2>/dev/null || true
+    if [[ "${RECORDER:-wf-recorder}" != */* ]]; then
+        RECORDER="$(command -v "${RECORDER:-wf-recorder}")" ||
+            die "wf-recorder is not installed; native/build.sh builds the patched one"
     fi
-    if [[ -n "${NULL_MODULE:-}" ]]; then
-        pactl unload-module "$NULL_MODULE" 2>/dev/null || true
+    [[ -x "$RECORDER" ]] || die "YTWS_RECORDER is not an executable: $RECORDER"
+    RECORDER_PATCHED=0
+    if [[ "$("$RECORDER" --help 2>&1)" == *--cfr* ]]; then
+        RECORDER_PATCHED=1
     fi
+}
+
+# Which preview client to run: ytws-preview from native/build.sh, which hands
+# captured frames to Hyprland without copying them and is idle while hidden or
+# while the stream does not change, else wl-mirror.
+resolve_preview() {
+    PREVIEW_COMMAND="$CONFIGURED_PREVIEW"
+    if [[ -z "$PREVIEW_COMMAND" && -x "$NATIVE_BIN/ytws-preview" ]]; then
+        PREVIEW_COMMAND="$NATIVE_BIN/ytws-preview"
+    fi
+    if [[ "${PREVIEW_COMMAND:-wl-mirror}" != */* ]]; then
+        PREVIEW_COMMAND="$(command -v "${PREVIEW_COMMAND:-wl-mirror}")" ||
+            die "no preview client: install wl-mirror, or build ytws-preview with native/build.sh"
+    fi
+    [[ -x "$PREVIEW_COMMAND" ]] || die "YTWS_PREVIEW is not an executable: $PREVIEW_COMMAND"
 }
 
 wf_recorder_args() {
     : "${VAAPI_DEVICE:?VAAPI_DEVICE is not set}"
-    WF_ARGS=(
-        -o "$OUTPUT"
-        --no-damage
+    WF_ARGS=(-o "$OUTPUT")
+    if [[ "${RECORDER_PATCHED:-0}" == 1 ]]; then
+        # Captures only when the stream changes and repeats the last frame to
+        # keep the rate constant; the audio is the mix node and nothing else.
+        WF_ARGS+=(--cfr --audio-backend=pipewire "--audio=$MIX_SINK")
+    else
+        # Stock wf-recorder gets a constant rate only by making Hyprland
+        # redraw the output for every frame.
+        WF_ARGS+=(--no-damage "--audio=$MIX_SINK.monitor")
+    fi
+    WF_ARGS+=(
         -r "$FPS"
         -c h264_vaapi
         -d "$VAAPI_DEVICE"
@@ -467,7 +590,6 @@ wf_recorder_args() {
         -p "g=$VIDEO_GOP"
         -p profile=high
         -b 2
-        "--audio=$MIX_SINK.monitor"
         -C aac
         -P "b=$AUDIO_BITRATE"
         -R 48000
@@ -508,6 +630,7 @@ discard_stale_session() {
 load_status() {
     MIRROR_STATE="" MIRROR_PID="" MIRROR_RESTARTS=0 WALLPAPER_PID=""
     LIVE_STATE="" LIVE_PID="" LIVE_SINCE="" LIVE_RECONNECTS=0 LIVE_KBPS=0 LIVE_ERROR=""
+    AUDIO_WATCH_PID="" AUDIO_DESCRIPTION=""
     if [[ -r "$STATUS_FILE" ]]; then
         # Written by this session's supervisor in the private runtime directory.
         # shellcheck disable=SC1090
@@ -562,8 +685,9 @@ stop_supervisor() {
     # Whatever a supervisor that died left behind.
     load_status
     stop_pid "$LIVE_PID" wf-recorder
-    stop_pid "$MIRROR_PID" wl-mirror
+    stop_pid "$MIRROR_PID" "$(preview_name)"
     stop_pid "$WALLPAPER_PID" swaybg
+    stop_pid "$AUDIO_WATCH_PID" pactl
     # Sessions started before the supervisor recorded helpers in the state.
     stop_pid "${STATE_MIRROR_PID:-}" wl-mirror
     stop_pid "${STATE_LIVE_PID:-}" wf-recorder
@@ -582,7 +706,9 @@ abort_start() {
 
 start_session() {
     validate_config
-    require_commands hyprctl jq pactl wl-mirror wf-recorder ffmpeg ss setsid
+    require_commands hyprctl jq pactl pw-link ffmpeg ss setsid
+    resolve_recorder
+    resolve_preview
     discard_stale_session
     ensure_module
     output_exists && die "Hyprland output '$OUTPUT' already exists"
@@ -593,9 +719,7 @@ start_session() {
         die "workspace must be a positive numeric Hyprland workspace"
 
     SIGNATURE="${HYPRLAND_INSTANCE_SIGNATURE:-}"
-    ORIGINAL_SINK="" ORIGINAL_SOURCE="" PREEXISTING_INPUTS=""
-    NULL_MODULE="" COMBINE_MODULE="" LOOPBACK_MODULE=""
-    SUPERVISOR_PID="" PREVIEW_ON=""
+    NULL_MODULE="" SUPERVISOR_PID="" PREVIEW_ON=""
 
     mkdir -p "$RUN_DIR" "$LOG_DIR"
     chmod 700 "$RUN_DIR" "$LOG_DIR"
@@ -719,6 +843,8 @@ sup_write_status() {
         "LIVE_RECONNECTS=$LIVE_RECONNECTS" \
         "LIVE_KBPS=$LIVE_KBPS" \
         "LIVE_ERROR=${LIVE_ERROR@Q}" \
+        "AUDIO_WATCH_PID=$AUDIO_WATCH_PID" \
+        "AUDIO_DESCRIPTION=${AUDIO_DESCRIPTION@Q}" \
         "STATUS_TIME=$EPOCHSECONDS" >"$STATUS_FILE"
 }
 
@@ -756,9 +882,19 @@ socket_acked() {
     return "$_sa_found"
 }
 
+# The executable name of the session's preview client.
+preview_name() {
+    local command="${PREVIEW_COMMAND:-wl-mirror}"
+    printf '%s' "${command##*/}"
+}
+
 sup_mirror_start() {
-    wl-mirror --backend "$MIRROR_BACKEND" --show-cursor --scaling fit \
-        --title "$PREVIEW_TITLE" "$OUTPUT" </dev/null >>"$LOG_DIR/wl-mirror.log" 2>&1 &
+    if [[ "$(preview_name)" == wl-mirror ]]; then
+        "${PREVIEW_COMMAND:-wl-mirror}" --backend "$MIRROR_BACKEND" --show-cursor --scaling fit \
+            --title "$PREVIEW_TITLE" "$OUTPUT" </dev/null >>"$LOG_DIR/preview.log" 2>&1 &
+    else
+        "$PREVIEW_COMMAND" --title "$PREVIEW_TITLE" "$OUTPUT" </dev/null >>"$LOG_DIR/preview.log" 2>&1 &
+    fi
     MIRROR_PID=$!
     MIRROR_STATE=up
     sup_log "preview started (pid $MIRROR_PID)"
@@ -779,7 +915,7 @@ sup_mirror_check() {
         MIRROR_STATE=failed
         MIRROR_PID=""
         notify_user -u critical "Stream preview keeps failing" \
-            "The stream itself is unaffected. See $LOG_DIR/wl-mirror.log."
+            "The stream itself is unaffected. See $LOG_DIR/preview.log."
         return 0
     fi
     MIRROR_RESTARTS=$((MIRROR_RESTARTS + 1))
@@ -796,7 +932,7 @@ sup_redact() {
 
 sup_live_attempt() {
     wf_recorder_args
-    wf-recorder "${WF_ARGS[@]}" -f "${YOUTUBE_RTMPS_URL%/}/$SUP_KEY" </dev/null \
+    "${RECORDER:-wf-recorder}" "${WF_ARGS[@]}" -f "${YOUTUBE_RTMPS_URL%/}/$SUP_KEY" </dev/null \
         > >(sup_redact >>"$LOG_DIR/live.log") 2>&1 &
     LIVE_PID=$!
     LIVE_ATTEMPT_AT=$EPOCHSECONDS
@@ -810,8 +946,37 @@ sup_live_attempt() {
     sup_log "connecting to YouTube (pid $LIVE_PID)"
 }
 
+# Default-device changes, as "audio" commands on the control FIFO.
+sup_audio_events() {
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+        *" on server "*|*"'new' on sink #"*|*"'remove' on sink #"*|*"'new' on source #"*|*"'remove' on source #"*)
+            printf '0 audio\n'
+            ;;
+        esac
+    done
+}
+
+# While viewers can hear the mix, keep it fed and follow the default devices.
+sup_audio_on() {
+    audio_link_sync
+    sup_log "stream audio: $AUDIO_DESCRIPTION"
+    pid_is_alive "$AUDIO_WATCH_PID" && return 0
+    pactl subscribe </dev/null 2>/dev/null > >(sup_audio_events >&"$SUP_CTL") &
+    AUDIO_WATCH_PID=$!
+}
+
+sup_audio_off() {
+    [[ -n "$AUDIO_WATCH_PID" ]] && kill "$AUDIO_WATCH_PID" 2>/dev/null
+    AUDIO_WATCH_PID=""
+    audio_unlink_all
+    AUDIO_DESCRIPTION=""
+}
+
 sup_live_give_up() {
     sup_log "giving up: $1"
+    sup_audio_off
     LIVE_WANTED=0
     LIVE_STATE=failed
     LIVE_ERROR="$1"
@@ -919,6 +1084,7 @@ sup_live_stop() {
         sup_live_kill "$LIVE_PID"
         sup_log "stopped live delivery"
     fi
+    sup_audio_off
     LIVE_PID=""
     LIVE_STATE=offline
     LIVE_KBPS=0
@@ -946,8 +1112,15 @@ sup_command() {
         LIVE_WANTED=1 LIVE_FAILURES=0 LIVE_RECONNECTS=0 LIVE_SINCE="" LIVE_ERROR="" LIVE_KBPS=0
         LIVE_STATE=connecting
         sup_set_live true
+        sup_audio_on
         sup_live_attempt
         sup_reply "$seq" ok
+        ;;
+    audio)
+        if (( LIVE_WANTED )); then
+            audio_link_sync
+            sup_log "stream audio: $AUDIO_DESCRIPTION"
+        fi
         ;;
     offline)
         sup_live_stop
@@ -971,6 +1144,7 @@ supervise_session() {
     MIRROR_STATE=stopped MIRROR_PID="" MIRROR_RESTARTS=0 MIRROR_FAILURES=() WALLPAPER_PID=""
     LIVE_STATE=offline LIVE_PID="" LIVE_SINCE="" LIVE_RECONNECTS=0 LIVE_KBPS=0 LIVE_ERROR=""
     LIVE_WANTED=0 LIVE_FAILURES=0 LIVE_RETRY_AT=0 SUP_KEY=""
+    AUDIO_WATCH_PID="" AUDIO_DESCRIPTION=""
     : >"$LOG_DIR/live.log"
 
     rm -f "$CONTROL_FIFO"
@@ -1103,7 +1277,7 @@ run_local_rtmp_test() {
     validate_config
     load_state
     load_status
-    require_commands ffmpeg ffprobe
+    require_commands ffmpeg ffprobe pw-link pw-play
     case "${LIVE_STATE:-offline}" in
     offline|failed) ;;
     *) die "YouTube delivery is $LIVE_STATE; stop it before a local test" ;;
@@ -1131,14 +1305,21 @@ run_local_rtmp_test() {
     receiver_pid=$!
     wait_until "local RTMP receiver" port_is_listening "$TEST_RTMP_PORT"
 
+    # A tone straight into the mix, through PipeWire itself as the recorder
+    # reads it: the test then costs what a live stream costs.
+    local tone="$RUN_DIR/test-tone.wav"
     ffmpeg -hide_banner -loglevel error -f lavfi \
         -i "sine=frequency=880:sample_rate=48000:duration=$seconds" \
-        -af volume=0.08 -f pulse -device "$MIX_SINK" \
-        yt-stream-workspace-test-tone >/dev/null 2>&1 &
+        -af volume=0.08 -ac 2 -y "$tone" || die "could not generate the test tone"
+    pw-play --target "$MIX_SINK" "$tone" >/dev/null 2>&1 &
     tone_pid=$!
 
+    audio_link_sync
+    trap audio_unlink_all EXIT
+    note "stream audio: $AUDIO_DESCRIPTION"
+
     wf_recorder_args
-    wf-recorder "${WF_ARGS[@]}" -f "$url" >"$sender_log" 2>&1 &
+    "${RECORDER:-wf-recorder}" "${WF_ARGS[@]}" -f "$url" >"$sender_log" 2>&1 &
     sender_pid=$!
     sleep 1
     unmute_capture "$sender_pid" || true
@@ -1151,6 +1332,9 @@ run_local_rtmp_test() {
         die "wf-recorder failed; see $sender_log"
     }
     wait "$tone_pid" 2>/dev/null || true
+    rm -f "$tone"
+    audio_unlink_all
+    trap - EXIT
 
     for _ in $(seq 1 50); do
         pid_is_alive "$receiver_pid" || break
@@ -1279,18 +1463,30 @@ show_status() {
             --arg workspace "$WORKSPACE" --arg output "$OUTPUT" \
             --arg live "${LIVE_STATE:-offline}" --arg since "${LIVE_SINCE:-}" \
             --arg kbps "${LIVE_KBPS:-0}" --arg reconnects "${LIVE_RECONNECTS:-0}" \
-            --arg error "${LIVE_ERROR:-}" --arg preview "${MIRROR_STATE:-}" '
+            --arg error "${LIVE_ERROR:-}" --arg preview "${MIRROR_STATE:-}" \
+            --arg desktop "${DESKTOP_AUDIO:-default}" --arg mic "${MIC:-default}" \
+            --arg linked "${AUDIO_DESCRIPTION:-}" \
+            --arg recorder "${RECORDER:-wf-recorder}" --argjson patched "$([[ "${RECORDER_PATCHED:-0}" == 1 ]] && echo true || echo false)" '
             {session: true, workspace: ($workspace | tonumber), output: $output,
              supervisor: $supervisor, preview: $preview,
              live: {state: $live, since: ($since | if . == "" then null else tonumber end),
                     kbps: ($kbps | tonumber), reconnects: ($reconnects | tonumber),
                     error: (if $error == "" then null else $error end)},
+             audio: {desktop: $desktop, microphone: $mic,
+                     linked: (if $linked == "" then null else $linked end)},
+             recorder: {path: $recorder, patched: $patched},
              guard: $guard}'
         return
     fi
     printf 'workspace:      %s on %s (%sx%s@%s scale %s)\n' \
         "$WORKSPACE" "$OUTPUT" "$WIDTH" "$HEIGHT" "$FPS" "$SCALE"
     printf 'YouTube:        %s\n' "$(describe_live)"
+    if [[ -n "${AUDIO_DESCRIPTION:-}" ]]; then
+        printf 'audio:          %s\n' "$AUDIO_DESCRIPTION"
+    else
+        printf 'audio:          nothing linked until live (desktop %s, microphone %s)\n' \
+            "${DESKTOP_AUDIO:-default}" "${MIC:-default}"
+    fi
     if [[ -n "$status" ]]; then
         jq -r --arg layers "^($STREAM_LAYERS)$" '
             "guard:          \(.phase), \(.corrections) correction(s)" +
@@ -1310,6 +1506,12 @@ show_status() {
     printf 'preview:        %s\n' "$preview"
     printf 'supervisor:     %s\n' "$([[ "$supervisor" == true ]] && echo running || echo "not running; run 'workspace-stream stop'")"
     printf 'VAAPI device:   %s\n' "${VAAPI_DEVICE:-unknown}"
+    if [[ "${RECORDER_PATCHED:-0}" == 1 ]]; then
+        printf 'recorder:       %s (patched)\n' "$RECORDER"
+    else
+        printf 'recorder:       %s (stock: Hyprland redraws the stream for every frame)\n' \
+            "${RECORDER:-wf-recorder}"
+    fi
     printf 'logs:           %s\n' "$LOG_DIR"
 }
 
@@ -1356,9 +1558,32 @@ run_doctor() {
     printf 'logs: %s\n' "$LOG_DIR"
 
     local command
-    for command in hyprctl jq pactl wl-mirror wf-recorder ffmpeg ffprobe ss setsid getent; do
+    for command in hyprctl jq pactl pw-link ffmpeg ffprobe ss setsid getent; do
         doctor_check_command "$command"
     done
+    local preview
+    if preview="$(resolve_preview 2>/dev/null && printf '%s' "$PREVIEW_COMMAND")"; then
+        if [[ "${preview##*/}" == wl-mirror ]]; then
+            printf 'warn preview: %s redraws the whole preview every frame while shown; native/build.sh builds ytws-preview, which does not\n' "$preview"
+        else
+            printf 'ok   preview: %s\n' "$preview"
+        fi
+    else
+        printf 'miss preview: neither ytws-preview nor wl-mirror is installed; native/build.sh builds ytws-preview\n'
+        DOCTOR_FAILED=1
+    fi
+    local recorder
+    if recorder="$(resolve_recorder 2>/dev/null && printf '%s %s' "$RECORDER_PATCHED" "$RECORDER")"; then
+        if [[ "${recorder%% *}" == 1 ]]; then
+            printf 'ok   recorder: %s (patched)\n' "${recorder#* }"
+        else
+            printf 'warn recorder: %s is stock wf-recorder, which makes Hyprland redraw the stream for every frame; native/build.sh builds the patched one\n' \
+                "${recorder#* }"
+        fi
+    else
+        printf 'miss recorder: wf-recorder is not installed; native/build.sh builds it\n'
+        DOCTOR_FAILED=1
+    fi
     doctor_check_optional_command swaybg "only needed for virtual-output wallpaper"
     doctor_check_optional_command notify-send "desktop notifications about live delivery"
     doctor_check_optional_command kitty "needed by self-test"

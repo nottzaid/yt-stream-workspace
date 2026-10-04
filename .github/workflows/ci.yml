@@ -15,3 +15,21 @@ jobs:
         run: make test
       - name: Isolated install and uninstall
         run: make smoke
+
+  native:
+    runs-on: ubuntu-latest
+    # Arch has the wayland-protocols, PipeWire and FFmpeg versions the
+    # native helpers are written against.
+    container: archlinux:latest
+    steps:
+      - name: Install build dependencies
+        run: >
+          pacman -Syu --noconfirm --needed git base-devel meson ninja pkgconf
+          wayland wayland-protocols mesa libdrm ffmpeg pipewire libpulse
+      - uses: actions/checkout@v7
+      - name: Build the patched wf-recorder and ytws-preview
+        run: native/build.sh "$RUNNER_TEMP/native"
+      - name: Check the builds
+        run: |
+          "$RUNNER_TEMP/native/wf-recorder" --help | grep -q -- --cfr
+          { "$RUNNER_TEMP/native/ytws-preview" 2>&1 || true; } | grep -q usage

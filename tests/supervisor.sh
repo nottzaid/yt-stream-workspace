@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Drive the session supervisor against fake wl-mirror and wf-recorder
-# binaries: connect, report bitrate, keep the key out of the log, recover a
+# Drive the session supervisor against fake ytws-preview, wf-recorder, pactl
+# and pw-link binaries: connect, report bitrate, keep the key out of the log,
+# feed the mix only while live and follow the default devices, recover a
 # stalled connection, give up on a refused key, restart a crashed preview,
 # keep commands that arrive while it is busy, and shut down cleanly.
 set -Eeuo pipefail
@@ -20,6 +21,7 @@ cleanup() {
 trap cleanup EXIT
 
 export XDG_RUNTIME_DIR="$TMP/run" XDG_STATE_HOME="$TMP/state" XDG_CONFIG_HOME="$TMP/config"
+export XDG_DATA_HOME="$TMP/data"
 export HYPRLAND_INSTANCE_SIGNATURE=test
 export YTWS_LIVE_CONNECTED_BYTES=65536 YTWS_LIVE_ESTABLISHED_SECONDS=2
 export YTWS_LIVE_STALL_SECONDS=2 YTWS_LIVE_CONNECT_SECONDS=3
@@ -86,8 +88,9 @@ slowstop)
     ;;
 esac
 EOF
-cat >"$FAKE/bin/wl-mirror" <<'EOF'
+cat >"$FAKE/bin/ytws-preview" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >"$FAKE_DIR/preview.args"
 exec {nap}<> <(:)
 while :; do read -r -t 1 -u "$nap" _ || true; done
 EOF
@@ -97,9 +100,41 @@ printf 'ok\n'
 EOF
 cat >"$FAKE/bin/pactl" <<'EOF'
 #!/usr/bin/env bash
-[[ "$*" == *"list source-outputs"* ]] && printf '[]\n'
+case "$*" in
+*"list source-outputs"*) printf '[]\n' ;;
+get-default-sink) cat "$FAKE_DIR/default-sink" ;;
+get-default-source) printf 'fake_mic\n' ;;
+subscribe)
+    printf '%s\n' "$$" >"$FAKE_DIR/subscribe.pid"
+    exec {nap}<> <(:)
+    while :; do read -r -t 1 -u "$nap" _ || true; done
+    ;;
+esac
 exit 0
 EOF
+# Ports of two output devices and a mono microphone; the links are a file
+# of "OUT IN" lines.
+cat >"$FAKE/bin/pw-link" <<'EOF'
+#!/usr/bin/env bash
+links="$FAKE_DIR/links"
+touch "$links"
+case "$1" in
+-o)
+    printf '%s\n' speakers:monitor_FL speakers:monitor_FR \
+        headphones:monitor_FL headphones:monitor_FR fake_mic:capture_MONO \
+        yt_stream_mix:monitor_FL yt_stream_mix:monitor_FR
+    ;;
+-d)
+    grep -Fvx -- "$2 $3" "$links" >"$links.new" || true
+    mv "$links.new" "$links"
+    ;;
+*)
+    grep -Fqx -- "$1 $2" "$links" && exit 1
+    printf '%s %s\n' "$1" "$2" >>"$links"
+    ;;
+esac
+EOF
+printf 'speakers\n' >"$FAKE/default-sink"
 cat >"$FAKE/bin/notify-send" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$FAKE_DIR/notify.log"
@@ -120,6 +155,7 @@ VIDEO_GOP=120
 AUDIO_BITRATE=128k
 YOUTUBE_RTMPS_URL=rtmps://ingest.invalid/live2
 MIX_SINK=yt_stream_mix
+PREVIEW_COMMAND=$FAKE/bin/ytws-preview
 MIRROR_BACKEND=auto
 WALLPAPER=/nonexistent
 NOTIFY=1
@@ -178,6 +214,8 @@ SUP=$!
 wait_for "the supervisor to start" 5 test -p "$RUN/control"
 wait_for "the preview" 5 is_state offline
 [[ "$(status_value MIRROR_STATE)" == up ]] || fail "preview not reported up"
+[[ "$(<"$FAKE/preview.args")" == "--title yt-stream-workspace preview YT-STREAM" ]] ||
+    fail "preview started as: $(<"$FAKE/preview.args")"
 
 # Going live: connecting, then live with a measured bitrate.
 send "1 live $KEY"
@@ -191,6 +229,22 @@ grep -Fq '<stream key>' "$LOGS/live.log" || fail "the publish URL was not logged
 if grep -Fq "$KEY" "$LOGS/live.log" "$TMP/supervisor.log" "$RUN/status"; then
     fail "the stream key leaked into a log or the status file"
 fi
+
+# Live, the mix hears the default output device and the microphone, and
+# follows a new default device.
+links_are() {
+    [[ "$(sort "$FAKE/links" 2>/dev/null | tr '\n' ' ')" == "$1" ]]
+}
+mic="fake_mic:capture_MONO yt_stream_mix:playback_FL fake_mic:capture_MONO yt_stream_mix:playback_FR"
+speakers="$mic speakers:monitor_FL yt_stream_mix:playback_FL speakers:monitor_FR yt_stream_mix:playback_FR "
+headphones="$mic headphones:monitor_FL yt_stream_mix:playback_FL headphones:monitor_FR yt_stream_mix:playback_FR "
+links_are "$speakers" || fail "live audio links: $(cat "$FAKE/links" 2>/dev/null)"
+[[ "$(status_value AUDIO_DESCRIPTION)" == "'desktop speakers, microphone fake_mic'" ]] ||
+    fail "audio sources not reported: $(status_value AUDIO_DESCRIPTION)"
+kill -0 "$(status_value AUDIO_WATCH_PID)" 2>/dev/null || fail "no device watcher while live"
+printf 'headphones\n' >"$FAKE/default-sink"
+send "0 audio"
+wait_for "links to follow the default device" 5 links_are "$headphones"
 
 # A second live request while live is refused.
 send "2 live $KEY"
@@ -222,6 +276,8 @@ send "4 ping"
 wait_for "the offline reply" 6 test -r "$RUN/reply"
 wait_for "the ping queued during the stop" 6 reply_is "4 ok"
 is_state offline || fail "offline did not stop delivery"
+[[ ! -s "$FAKE/links" ]] || fail "audio links left after going offline: $(cat "$FAKE/links")"
+! kill -0 "$(<"$FAKE/subscribe.pid")" 2>/dev/null || fail "the device watcher outlived live delivery"
 
 # A key YouTube keeps refusing ends in a clear failure instead of a loop.
 printf 'refuse\n' >"$FAKE/mode"
@@ -252,7 +308,9 @@ wait "$SUP" 2>/dev/null || true
 SUP=""
 [[ ! -e "$RUN/control" ]] || fail "control FIFO left behind"
 ! kill -0 "$live_pid" 2>/dev/null || fail "wf-recorder survived the supervisor"
-! kill -0 "$mirror" 2>/dev/null || fail "wl-mirror survived the supervisor"
+! kill -0 "$mirror" 2>/dev/null || fail "the preview survived the supervisor"
+! kill -0 "$(<"$FAKE/subscribe.pid")" 2>/dev/null || fail "the device watcher survived the supervisor"
+[[ ! -s "$FAKE/links" ]] || fail "audio links left after shutdown: $(cat "$FAKE/links")"
 is_state offline || fail "final status not offline"
 
 printf 'supervisor checks passed\n'

@@ -10,6 +10,7 @@ BACKUP_DIR="$INSTALL_STATE_DIR/backups"
 BIN_MARKER="$INSTALL_STATE_DIR/bin"
 CONFIG_MARKER="$INSTALL_STATE_DIR/config"
 SNIPPET_MARKER="$INSTALL_STATE_DIR/hypr-snippet"
+NATIVE_MARKER="$INSTALL_STATE_DIR/native"
 PURGE=0
 
 case "${1:-}" in
@@ -148,6 +149,15 @@ restore_or_remove \
     "$BACKUP_DIR/${managed_module##*/}" "Hyprland module"
 
 rm -f "$HYPR_SOURCE_MARKER"
+
+if [[ -r "$NATIVE_MARKER" ]]; then
+    native_dir="$(sed -n '1p' "$NATIVE_MARKER")"
+    if [[ -n "$native_dir" ]]; then
+        rm -f "$native_dir/wf-recorder" "$native_dir/ytws-preview"
+        rmdir "$native_dir" "${native_dir%/*}" 2>/dev/null || true
+    fi
+    rm -f "$NATIVE_MARKER"
+fi
 
 if [[ "$PURGE" == 1 ]]; then
     restore_or_remove \
