@@ -35,6 +35,14 @@ workspace-stream doctor && workspace-stream self-test
   [Performance](#performance)) into `~/.local/share/yt-stream-workspace/bin`.
   Without them the tool falls back to stock `wf-recorder` and `wl-mirror`.
 
+Nothing needs configuring to use them: `workspace-stream` looks in that
+directory before `PATH`. `workspace-stream doctor` warns while a stock helper
+is in use, and `workspace-stream status` prints `recorder: … (patched)` once the
+patched one is. If you deploy the script without `install.sh` (a Nix or Home
+Manager link, say), run `native/build.sh` yourself on each machine and again
+after any change under `native/`; it builds against the system FFmpeg, Mesa and
+PipeWire so that VAAPI encoding works.
+
 `./uninstall.sh` removes exactly what was installed and restores what it
 replaced. `--purge` also removes the config.
 
