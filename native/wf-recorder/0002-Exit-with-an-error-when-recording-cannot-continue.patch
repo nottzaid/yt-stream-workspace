@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kant <283011337+muradkant@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 19:53:03 +0300
+Subject: [PATCH 2/7] Exit with an error when recording cannot continue
+
+Failures that end a recording (the output can no longer be written,
+frames cannot be captured, the audio source cannot be opened or read)
+now make wf-recorder exit with a failure status instead of 0. The audio
+source failing no longer leaves a recording running without sound: the
+user asked for audio, and a silent recording is only noticed afterwards.
+---
+ src/frame-writer.cpp |  3 ++-
+ src/frame-writer.hpp |  3 +++
+ src/main.cpp         | 27 +++++++++++++++++++++------
+ src/pulse.cpp        |  1 +
+ 4 files changed, 27 insertions(+), 7 deletions(-)
+
+diff --git a/src/frame-writer.cpp b/src/frame-writer.cpp
+index 1275a5f..3800e04 100644
+--- a/src/frame-writer.cpp
++++ b/src/frame-writer.cpp
+@@ -1041,7 +1041,8 @@ void FrameWriter::finish_frame(AVCodecContext *enc_ctx, AVPacket& pkt)
+     }
+ #endif
+     if (av_interleaved_write_frame(fmtCtx, &pkt) != 0) {
+-        params.write_aborted_flag = true;
++        std::cerr << "Failed to write the output, stopping" << std::endl;
++        request_exit(true);
+     }
+     av_packet_unref(&pkt);
+ #ifdef HAVE_AUDIO
+diff --git a/src/frame-writer.hpp b/src/frame-writer.hpp
+index a1dce90..331e7c3 100644
+--- a/src/frame-writer.hpp
++++ b/src/frame-writer.hpp
+@@ -146,4 +146,7 @@ extern std::mutex frame_writer_mutex, frame_writer_pending_mutex;
+ extern std::unique_ptr<FrameWriter> frame_writer;
+ extern std::atomic<bool> exit_main_loop;
+ 
++/* Stop recording; with failure, wf-recorder exits with an error status. */
++void request_exit(bool failure);
++
+ #endif // FRAME_WRITER
+diff --git a/src/main.cpp b/src/main.cpp
+index 8ff65f9..70c24f6 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -197,6 +197,14 @@ struct wf_buffer : public buffer_pool_buf
+ };
+ 
+ std::atomic<bool> exit_main_loop{false};
++static std::atomic<bool> exit_failure{false};
++
++void request_exit(bool failure)
++{
++    if (failure)
++        exit_failure = true;
++    exit_main_loop = true;
++}
+ 
+ buffer_pool<wf_buffer, 16> buffers;
+ 
+@@ -340,7 +348,7 @@ static void frame_handle_failed(void *, struct zwlr_screencopy_frame_v1 *) {
+     if (frame_failed_cnt > MAX_FRAME_FAILURES)
+     {
+         std::cerr << "Failed to copy frame too many times, exiting!" << std::endl;
+-        exit_main_loop = true;
++        request_exit(true);
+     }
+ }
+ 
+@@ -366,7 +374,7 @@ static void dmabuf_created(void *data, struct zwp_linux_buffer_params_v1 *,
+ 
+ static void dmabuf_failed(void *, struct zwp_linux_buffer_params_v1 *) {
+     std::cerr << "Failed to create dmabuf" << std::endl;
+-    exit_main_loop = true;
++    request_exit(true);
+ }
+ 
+ static const struct zwp_linux_buffer_params_v1_listener params_listener = {
+@@ -421,7 +429,7 @@ static void frame_handle_linux_dmabuf(void *, struct zwlr_screencopy_frame_v1 *f
+         if (buffer.bo == NULL)
+         {
+             std::cerr << "Failed to create gbm bo" << std::endl;
+-            exit_main_loop = true;
++            request_exit(true);
+             return;
+         }
+ 
+@@ -661,10 +669,17 @@ static void write_loop(FrameWriterParams params)
+                 audioParams.audio_frame_size = frame_writer->get_audio_buffer_size();
+                 audioParams.sample_rate = params.sample_rate;
+                 pr = std::unique_ptr<AudioReader> (AudioReader::create(audioParams));
+-                if (pr)
++                if (!pr)
+                 {
+-                    pr->start();
++                    /* A recording that silently lost its sound is worse
++                     * than none: nothing tells the user until it is too
++                     * late. */
++                    std::cerr << "Failed to open the audio source, stopping" << std::endl;
++                    request_exit(true);
++                    frame_writer_mutex.unlock();
++                    break;
+                 }
++                pr->start();
+             }
+ #endif
+         }
+@@ -1434,5 +1449,5 @@ int main(int argc, char *argv[])
+         close(drm_fd);
+     }
+ 
+-    return EXIT_SUCCESS;
++    return exit_failure ? EXIT_FAILURE : EXIT_SUCCESS;
+ }
+diff --git a/src/pulse.cpp b/src/pulse.cpp
+index 53e485a..4f15831 100644
+--- a/src/pulse.cpp
++++ b/src/pulse.cpp
+@@ -57,6 +57,7 @@ bool PulseReader::loop()
+     {
+         std::cerr << "Failed to read from PulseAudio stream: "
+             << pa_strerror(perr) << std::endl;
++        request_exit(true);
+         return false;
+     }
+ 

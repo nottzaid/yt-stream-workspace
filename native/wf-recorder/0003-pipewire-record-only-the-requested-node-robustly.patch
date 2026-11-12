@@ -1,0 +1,393 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kant <283011337+muradkant@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 19:53:33 +0300
+Subject: [PATCH 3/7] pipewire: record only the requested node, robustly
+
+- Never fall back to another device. A source that does not exist was
+  replaced by the default one, and routing policy could later move or
+  restore the stream onto anything else; either way the recording got
+  sound nobody chose. Resolve the node once, target it by serial, and
+  opt out of fallback, moving, reconnection and remembered state.
+- Accept a sink's PulseAudio monitor name (X.monitor) for the sink X.
+- Honour the chunk offset and clamp the chunk to its buffer; carry
+  partial codec frames over without a fixed-size, overflowable buffer.
+- Date the first captured sample rather than the cycle that delivered
+  it, publish it atomically to the encoder thread, and request a
+  quantum of one codec frame.
+- Stop with an error when the stream fails or the source stops
+  delivering samples for 3 seconds, instead of recording on without
+  sound.
+---
+ src/pipewire.cpp | 209 ++++++++++++++++++++++++++++++++++-------------
+ src/pipewire.hpp |  26 ++++--
+ 2 files changed, 174 insertions(+), 61 deletions(-)
+
+diff --git a/src/pipewire.cpp b/src/pipewire.cpp
+index 9f213d1..e45886f 100644
+--- a/src/pipewire.cpp
++++ b/src/pipewire.cpp
+@@ -1,11 +1,18 @@
+ #include "pipewire.hpp"
+ #include "frame-writer.hpp"
++#include <algorithm>
++#include <cstring>
+ #include <iostream>
+ #include <spa/param/audio/format-utils.h>
+ 
++/* A capture that delivers nothing for this long has lost its source. */
++#define WATCHDOG_NSEC (3 * SPA_NSEC_PER_SEC)
++
+ PipeWireReader::~PipeWireReader()
+ {
+     pw_thread_loop_lock(thread_loop);
++    if (watchdog)
++        pw_loop_destroy_source(pw_thread_loop_get_loop(thread_loop), watchdog);
+     if (stream) {
+         spa_hook_remove(&stream_listener);
+         if (pw_stream_get_state(stream, nullptr) != PW_STREAM_STATE_UNCONNECTED)
+@@ -22,23 +29,34 @@ PipeWireReader::~PipeWireReader()
+         pw_context_destroy(context);
+     pw_thread_loop_destroy(thread_loop);
+     pw_deinit();
++}
+ 
+-    delete []buf;
++static void fail(const char *what)
++{
++    std::cerr << "pipewire: " << what << std::endl;
++    request_exit(true);
+ }
+ 
+ static void on_core_done(void *data, uint32_t id, int seq)
+ {
+     PipeWireReader *pr = static_cast<PipeWireReader*>(data);
+ 
+-    if (id == PW_ID_CORE && pr->seq == seq)
++    if (id == PW_ID_CORE && pr->seq == seq) {
++        pr->synced = true;
+         pw_thread_loop_signal(pr->thread_loop, false);
++    }
+ }
+ 
+-static void on_core_error(void *data, uint32_t, int, int res, const char *message)
++static void on_core_error(void *data, uint32_t id, int, int res, const char *message)
+ {
+     PipeWireReader *pr = static_cast<PipeWireReader*>(data);
+ 
+     std::cerr << "pipewire: core error " << res << " " << message << std::endl;
++    if (id == PW_ID_CORE) {
++        pr->core_failed = true;
++        if (pr->stream)
++            fail("lost the connection to PipeWire");
++    }
+     pw_thread_loop_signal(pr->thread_loop, false);
+ }
+ 
+@@ -55,9 +73,46 @@ static const struct pw_core_events core_events = {
+     .bound_props = nullptr,
+ };
+ 
++static void on_registry_global(void *data, uint32_t, uint32_t, const char *type, uint32_t, const struct spa_dict *props)
++{
++    PipeWireReader *pr = static_cast<PipeWireReader*>(data);
++
++    if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0 || pr->target_exact)
++        return;
++
++    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
++    const char *media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
++    const char *serial = spa_dict_lookup(props, PW_KEY_OBJECT_SERIAL);
++    if (!name || !media_class || !serial || strncmp(media_class, "Audio/", 6) != 0)
++        return;
++
++    const bool is_sink = strstr(media_class, "Sink") != nullptr;
++    const std::string wanted = pr->params.audio_source;
++    const std::string monitor_suffix = ".monitor";
++
++    if (wanted == name) {
++        pr->target_exact = true;
++    } else if (is_sink && wanted.size() > monitor_suffix.size() &&
++        wanted.compare(wanted.size() - monitor_suffix.size(), std::string::npos, monitor_suffix) == 0 &&
++        wanted.compare(0, wanted.size() - monitor_suffix.size(), name) == 0) {
++        /* PulseAudio spelling of a sink's monitor: capture the sink. */
++    } else {
++        return;
++    }
++
++    pr->target_serial = serial;
++    pr->target_is_sink = is_sink;
++}
++
++static const struct pw_registry_events registry_events = {
++    .version = PW_VERSION_REGISTRY_EVENTS,
++    .global = on_registry_global,
++    .global_remove = nullptr,
++};
++
+ bool PipeWireReader::init()
+ {
+-    buf = new uint8_t[params.audio_frame_size * 4];
++    pending.resize(params.audio_frame_size);
+ 
+     int argc = 0;
+     pw_init(&argc, nullptr);
+@@ -85,33 +140,85 @@ bool PipeWireReader::init()
+     }
+     pw_core_add_listener(core, &core_listener, &core_events, this);
+ 
++    if (params.audio_source) {
++        struct pw_registry *registry = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
++        struct spa_hook registry_listener;
++        spa_zero(registry_listener);
++        pw_registry_add_listener(registry, &registry_listener, &registry_events, this);
++        seq = pw_core_sync(core, PW_ID_CORE, seq);
++        while (!synced && !core_failed)
++            pw_thread_loop_wait(thread_loop);
++        spa_hook_remove(&registry_listener);
++        pw_proxy_destroy(reinterpret_cast<struct pw_proxy*>(registry));
++
++        /* Recording some other device instead would put sound nobody
++         * chose into the recording. */
++        if (target_serial.empty() || core_failed) {
++            std::cerr << "pipewire: no audio node named " << params.audio_source << std::endl;
++            pw_thread_loop_unlock(thread_loop);
++            return false;
++        }
++        std::cerr << "Using PipeWire node: " << params.audio_source << std::endl;
++    }
++
++    pw_thread_loop_unlock(thread_loop);
+     return true;
+ }
+ 
++static void on_stream_state_changed(void *data, enum pw_stream_state, enum pw_stream_state state, const char *error)
++{
++    PipeWireReader *pr = static_cast<PipeWireReader*>(data);
++
++    if (state == PW_STREAM_STATE_ERROR) {
++        std::cerr << "pipewire: stream error: " << (error ? error : "unknown") << std::endl;
++        fail("audio capture failed");
++    } else if (state == PW_STREAM_STATE_STREAMING) {
++        pr->streaming = true;
++    }
++}
++
+ static void on_stream_process(void *data)
+ {
+     PipeWireReader *pr = static_cast<PipeWireReader*>(data);
+ 
+     struct pw_buffer *b = pw_stream_dequeue_buffer(pr->stream);
+-    if (!b) {
+-        std::cerr << "pipewire: out of buffers: " << strerror(errno) << std::endl;
++    if (!b)
+         return;
+-    }
++
++    const size_t frame_size = pr->params.audio_frame_size;
++    const size_t sample_bytes = 2 * sizeof(float);
++    pr->last_process_nsec = pw_stream_get_nsec(pr->stream);
+ 
+     for (uint32_t i = 0; i < b->buffer->n_datas; ++i) {
+         struct spa_data *d = &b->buffer->datas[i];
+-        memcpy(pr->buf + pr->buf_size, d->data, d->chunk->size);
+-        pr->buf_size += d->chunk->size;
+-        while (pr->buf_size >= pr->params.audio_frame_size) {
+-            frame_writer->add_audio(pr->buf);
+-            pr->buf_size -= pr->params.audio_frame_size;
+-            if (pr->buf_size)
+-                memmove(pr->buf, pr->buf + pr->params.audio_frame_size, pr->buf_size);
++        if (!d->data || !d->chunk)
++            continue;
++
++        const uint32_t offset = std::min(d->chunk->offset, d->maxsize);
++        size_t left = std::min(d->chunk->size, d->maxsize - offset);
++        left -= left % sample_bytes;
++        const uint8_t *src = static_cast<const uint8_t*>(d->data) + offset;
++
++        if (left && !pr->time_base) {
++            /* The buffer holds the quantum that ended when its cycle
++             * started; date the first sample, not the cycle. */
++            uint64_t nsec = b->time ? b->time : pr->last_process_nsec;
++            uint64_t span = left / sample_bytes * SPA_NSEC_PER_SEC / pr->params.sample_rate;
++            pr->time_base = (nsec > span ? nsec - span : nsec) / 1000;
+         }
+-    }
+ 
+-    if (!pr->time_base)
+-        pr->time_base = b->time;
++        while (left) {
++            size_t n = std::min(left, frame_size - pr->pending_size);
++            memcpy(pr->pending.data() + pr->pending_size, src, n);
++            pr->pending_size += n;
++            src += n;
++            left -= n;
++            if (pr->pending_size == frame_size) {
++                frame_writer->add_audio(pr->pending.data());
++                pr->pending_size = 0;
++            }
++        }
++    }
+ 
+     pw_stream_queue_buffer(pr->stream, b);
+ }
+@@ -119,7 +226,7 @@ static void on_stream_process(void *data)
+ static const struct pw_stream_events stream_events = {
+     .version = PW_VERSION_STREAM_EVENTS,
+     .destroy = nullptr,
+-    .state_changed = nullptr,
++    .state_changed = on_stream_state_changed,
+     .control_info = nullptr,
+     .io_changed = nullptr,
+     .param_changed = nullptr,
+@@ -131,57 +238,40 @@ static const struct pw_stream_events stream_events = {
+     .trigger_done = nullptr,
+ };
+ 
+-static void on_registry_global(void *data, uint32_t, uint32_t, const char *type, uint32_t, const struct spa_dict *props)
++static void on_watchdog(void *data, uint64_t)
+ {
+     PipeWireReader *pr = static_cast<PipeWireReader*>(data);
+ 
+-    if (strcmp(type, PW_TYPE_INTERFACE_Node) != 0)
+-        return;
+-
+-    const char *name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+-    if (!name || strcmp(pr->params.audio_source, name) != 0)
+-        return;
+-
+-    const char *media_class = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
+-    if (!media_class)
++    if (!pr->streaming || !pr->last_process_nsec)
+         return;
+-
+-    pr->source_found = true;
+-    pr->source_is_sink = strcmp(media_class, "Audio/Sink") == 0;
++    if (pw_stream_get_nsec(pr->stream) - pr->last_process_nsec > WATCHDOG_NSEC)
++        fail("the audio source stopped delivering samples");
+ }
+ 
+-static const struct pw_registry_events registry_events = {
+-    .version = PW_VERSION_REGISTRY_EVENTS,
+-    .global = on_registry_global,
+-    .global_remove = nullptr,
+-};
+-
+ void PipeWireReader::start()
+ {
++    pw_thread_loop_lock(thread_loop);
++
++    const size_t quantum = params.audio_frame_size / (2 * sizeof(float));
+     struct pw_properties *props =
+         pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio",
+                           PW_KEY_MEDIA_CATEGORY, "Capture",
+                           PW_KEY_MEDIA_ROLE, "Screen",
+-                          PW_KEY_STREAM_CAPTURE_SINK, "true",
+                           PW_KEY_NODE_NAME, "wf-recorder",
++                          /* What is recorded is chosen here, never by
++                           * remembered or policy routing. */
++                          PW_KEY_NODE_DONT_RECONNECT, "true",
++                          "node.dont-fallback", "true",
++                          "node.dont-move", "true",
++                          "state.restore-props", "false",
++                          "state.restore-target", "false",
+                           NULL);
+-
+-    if (params.audio_source) {
+-        struct pw_registry *registry = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
+-        if (registry) {
+-            struct spa_hook registry_listener;
+-            pw_registry_add_listener(registry, &registry_listener, &registry_events, this);
+-            seq = pw_core_sync(core, PW_ID_CORE, seq);
+-            pw_thread_loop_wait(thread_loop);
+-            if (!source_found) {
+-                std::cerr << "pipewire: source " << params.audio_source << " not found, using default" << std::endl;
+-            } else {
+-                pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, source_is_sink ? "true" : "false");
+-                pw_properties_set(props, PW_KEY_TARGET_OBJECT, params.audio_source);
+-            }
+-            spa_hook_remove(&registry_listener);
+-            pw_proxy_destroy(reinterpret_cast<struct pw_proxy*>(registry));
+-        }
++    pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%zu/%u", quantum, params.sample_rate);
++    if (target_serial.empty()) {
++        pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, "true");
++    } else {
++        pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, target_is_sink ? "true" : "false");
++        pw_properties_set(props, PW_KEY_TARGET_OBJECT, target_serial.c_str());
+     }
+ 
+     stream = pw_stream_new(core, "wf-recorder", props);
+@@ -194,6 +284,8 @@ void PipeWireReader::start()
+     info.format = SPA_AUDIO_FORMAT_F32_LE;
+     info.rate = params.sample_rate;
+     info.channels = 2;
++    info.position[0] = SPA_AUDIO_CHANNEL_FL;
++    info.position[1] = SPA_AUDIO_CHANNEL_FR;
+     const struct spa_pod *audio_param = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &info);
+ 
+     pw_stream_connect(stream,
+@@ -204,10 +296,15 @@ void PipeWireReader::start()
+                                                         PW_STREAM_FLAG_MAP_BUFFERS),
+                       &audio_param, 1);
+ 
++    struct pw_loop *loop = pw_thread_loop_get_loop(thread_loop);
++    watchdog = pw_loop_add_timer(loop, on_watchdog, this);
++    struct timespec interval = { 1, 0 };
++    pw_loop_update_timer(loop, watchdog, &interval, &interval, false);
++
+     pw_thread_loop_unlock(thread_loop);
+ }
+ 
+ uint64_t PipeWireReader::get_time_base() const
+ {
+-    return time_base / 1000;
++    return time_base;
+ }
+diff --git a/src/pipewire.hpp b/src/pipewire.hpp
+index dccbcd3..7d3fdf8 100644
+--- a/src/pipewire.hpp
++++ b/src/pipewire.hpp
+@@ -3,6 +3,9 @@
+ 
+ #include "audio.hpp"
+ 
++#include <atomic>
++#include <string>
++#include <vector>
+ #include <pipewire/pipewire.h>
+ 
+ class PipeWireReader : public AudioReader
+@@ -19,15 +22,28 @@ public:
+     struct spa_hook core_listener;
+     struct pw_stream *stream = nullptr;
+     struct spa_hook stream_listener;
++    struct spa_source *watchdog = nullptr;
+ 
+     int seq = 0;
+-    bool source_found = false;
+-    bool source_is_sink = false;
++    bool synced = false;
++    bool core_failed = false;
+ 
+-    uint8_t *buf = nullptr;
+-    size_t buf_size = 0;
++    /* The node to capture, resolved from params.audio_source. */
++    std::string target_serial;
++    bool target_is_sink = false;
++    bool target_exact = false;
+ 
+-    uint64_t time_base = 0;
++    /* Samples carried over between PipeWire buffers until they fill a
++     * codec frame. */
++    std::vector<uint8_t> pending;
++    size_t pending_size = 0;
++
++    bool streaming = false;
++    uint64_t last_process_nsec = 0;
++
++    /* Monotonic time of the first captured sample, in microseconds; read
++     * by the encoder thread. */
++    std::atomic<uint64_t> time_base{0};
+ };
+ 
+ #endif /* end of include guard: PIPEWIRE_HPP */

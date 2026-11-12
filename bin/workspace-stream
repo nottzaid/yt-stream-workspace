@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
+# workspace-stream: stream one Hyprland workspace to YouTube while every other
+# workspace stays private. The compositor side of the boundary lives in
+# hyprland/yt-stream-workspace.lua; README.md explains the design.
 set -Eeuo pipefail
+
+PROTOCOL=1
+PREVIEW_TITLE="yt-stream-workspace preview"
 
 CONFIG_FILE="${YTWS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/yt-stream-workspace/config}"
 if [[ -r "$CONFIG_FILE" ]]; then
@@ -20,13 +26,39 @@ VIDEO_GOP="${YTWS_VIDEO_GOP:-$((FPS * 2))}"
 AUDIO_BITRATE="${YTWS_AUDIO_BITRATE:-128k}"
 TEST_RTMP_PORT="${YTWS_TEST_RTMP_PORT:-19350}"
 YOUTUBE_RTMPS_URL="${YTWS_YOUTUBE_RTMPS_URL:-rtmps://a.rtmps.youtube.com/live2}"
-WALLPAPER="${YTWS_WALLPAPER:-$HOME/Pictures/background.png}"
+# Where `live` gets the stream key: the first line printed by a command, or a
+# file only you can read. Without either it asks on the terminal.
+STREAM_KEY_COMMAND="${YTWS_STREAM_KEY_COMMAND:-}"
+STREAM_KEY_FILE="${YTWS_STREAM_KEY_FILE:-}"
+NOTIFY="${YTWS_NOTIFY:-1}"
+WALLPAPER="${YTWS_WALLPAPER:-$HOME/Pictures/background.jpg}"
 CONFIGURED_VAAPI_DEVICE="${YTWS_VAAPI_DEVICE:-}"
+MIRROR_BACKEND="${YTWS_MIRROR_BACKEND:-auto}"
+PREVIEW_MONITOR="${YTWS_PREVIEW_MONITOR:-}"
+# Layer surfaces (bars, notifications, launchers, ...) whose namespace does not
+# match this pattern are painted black in the capture while a session runs.
+STREAM_LAYERS="${YTWS_STREAM_LAYERS:-.*wallpaper.*|hyprpaper|swww-daemon|mpvpaper.*}"
+# Windows whose class matches this pattern are painted black in the capture.
+PRIVATE_WINDOWS="${YTWS_PRIVATE_WINDOWS-org\.keepassxc\.KeePassXC|KeePassXC|1[Pp]assword|[Bb]itwarden|com\.bitwarden\.desktop|gcr-prompter|org\.gnome\.seahorse\.Application}"
 
 MIX_SINK="${YTWS_MIX_SINK:-yt_stream_mix}"
-OUTPUT_SINK="${YTWS_OUTPUT_SINK:-yt_stream_output}"
-STATE_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/yt-stream-workspace"
-STATE_FILE="$STATE_DIR/state"
+# What viewers hear: the default output device and the default microphone,
+# followed when either changes. "none" leaves one out; a node name pins one.
+DESKTOP_AUDIO="${YTWS_DESKTOP_AUDIO:-default}"
+MIC="${YTWS_MIC:-default}"
+# Helpers built by native/build.sh, used when present: the patched recorder
+# and the copy-free preview. Otherwise wf-recorder and wl-mirror from PATH.
+NATIVE_BIN="${XDG_DATA_HOME:-$HOME/.local/share}/yt-stream-workspace/bin"
+CONFIGURED_RECORDER="${YTWS_RECORDER:-}"
+CONFIGURED_PREVIEW="${YTWS_PREVIEW:-}"
+RUN_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/yt-stream-workspace"
+STATE_FILE="$RUN_DIR/state"
+SESSION_FILE="$RUN_DIR/session.lua"
+PHASE_FILE="$RUN_DIR/phase"
+CONTROL_FIFO="$RUN_DIR/control"
+STATUS_FILE="$RUN_DIR/status"
+REPLY_FILE="$RUN_DIR/reply"
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/yt-stream-workspace"
 SELF="$(readlink -f "$0")"
 
 die() {
@@ -41,21 +73,24 @@ note() {
 usage() {
     cat <<EOF
 Usage:
-  workspace-stream start [WORKSPACE]   Prepare an isolated interactive stream workspace
-  workspace-stream enter               Send keyboard/mouse input to the stream workspace
-  workspace-stream leave               Return keyboard/mouse input to the original monitor
-  workspace-stream workspace SELECTOR  Hyprland-safe workspace switch helper
-  workspace-stream test [SECONDS]      Test mirror, video, audio, and local RTMP
-  workspace-stream live                Stream the isolated output to YouTube
-  workspace-stream stop-live           Stop YouTube delivery, keep the workspace
-  workspace-stream status              Show component status
-  workspace-stream doctor              Check local prerequisites and config
-  workspace-stream stop                Restore desktop/audio state
-  workspace-stream self-test           Run an automated temporary-workspace integration test
+  workspace-stream start [WORKSPACE]   Isolate a workspace on the stream output
+  workspace-stream stop                End the session and restore everything
+  workspace-stream live                Go live on YouTube; reconnects on its own
+  workspace-stream stop-live           Stop YouTube delivery, keep the session
+  workspace-stream enter               Work in the stream workspace (Super+F11)
+  workspace-stream leave               Return to the physical monitor (Super+F12)
+  workspace-stream toggle              Enter or leave
+  workspace-stream curtain [on|off]    Hide the stream picture and sound (Super+F10)
+  workspace-stream workspace SELECTOR  Switch workspaces (for wrapper scripts)
+  workspace-stream test [SECONDS]      Record locally and validate video and audio
+  workspace-stream status [--json]     Show what the stream shows and its health
+  workspace-stream logs                Show the persistent diagnostic log location
+  workspace-stream doctor              Check prerequisites and configuration
+  workspace-stream self-test           Run the automated integration test
 
-WORKSPACE defaults to the currently active numeric Hyprland workspace.
-The capture source is the Hyprland output named '$OUTPUT', not the workspace
-where this command was launched.
+WORKSPACE defaults to the active numeric Hyprland workspace. Viewers see only
+the Hyprland output '$OUTPUT'. While a session runs, Hyprland itself keeps every
+other workspace off that output, so ordinary workspace keys are safe.
 EOF
 }
 
@@ -67,12 +102,51 @@ require_commands() {
     done
 }
 
+regex_is_valid() {
+    local status=0
+    # [[ =~ ]] returns 2, not 1, for a pattern that does not compile.
+    # shellcheck disable=SC2319
+    [[ "" =~ ^($1)$ ]] 2>/dev/null || status=$?
+    (( status != 2 ))
+}
+
 validate_config() {
     [[ "$WIDTH" =~ ^[1-9][0-9]*$ ]] || die "YTWS_WIDTH must be a positive integer"
     [[ "$HEIGHT" =~ ^[1-9][0-9]*$ ]] || die "YTWS_HEIGHT must be a positive integer"
     [[ "$FPS" =~ ^[1-9][0-9]*$ ]] || die "YTWS_FPS must be a positive integer"
     [[ "$TEST_RTMP_PORT" =~ ^[1-9][0-9]*$ ]] || die "YTWS_TEST_RTMP_PORT must be a positive integer"
     [[ "$VIDEO_GOP" =~ ^[1-9][0-9]*$ ]] || die "YTWS_VIDEO_GOP must be a positive integer"
+    (( WIDTH % 2 == 0 )) || die "YTWS_WIDTH must be even for H.264"
+    (( HEIGHT % 2 == 0 )) || die "YTWS_HEIGHT must be even for H.264"
+    (( FPS <= 60 )) || die "YTWS_FPS must not exceed YouTube's 60 fps limit"
+    (( TEST_RTMP_PORT <= 65535 )) || die "YTWS_TEST_RTMP_PORT must be at most 65535"
+    (( VIDEO_GOP <= FPS * 4 )) ||
+        die "YTWS_VIDEO_GOP must not exceed four seconds ($((FPS * 4)) frames)"
+    [[ "$SCALE" =~ ^([1-9][0-9]*(\.[0-9]+)?|0+\.[0-9]*[1-9][0-9]*)$ ]] ||
+        die "YTWS_SCALE must be a positive number"
+    [[ "$OUTPUT" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "YTWS_OUTPUT may contain only letters, numbers, dot, underscore, and hyphen"
+    [[ "$MIX_SINK" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "YTWS_MIX_SINK may contain only letters, numbers, dot, underscore, and hyphen"
+    [[ "$DESKTOP_AUDIO" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "YTWS_DESKTOP_AUDIO must be default, none, or a PipeWire sink name"
+    [[ "$MIC" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "YTWS_MIC must be default, none, or a PipeWire source name"
+    [[ -z "$PREVIEW_MONITOR" || "$PREVIEW_MONITOR" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "YTWS_PREVIEW_MONITOR must be a Hyprland monitor name"
+    { [[ -n "$STREAM_LAYERS" && "$STREAM_LAYERS" != *[[:cntrl:]]* ]] &&
+        regex_is_valid "$STREAM_LAYERS"; } ||
+        die "YTWS_STREAM_LAYERS must be a regular expression"
+    { [[ "$PRIVATE_WINDOWS" != *[[:cntrl:]]* ]] && regex_is_valid "$PRIVATE_WINDOWS"; } ||
+        die "YTWS_PRIVATE_WINDOWS must be a regular expression"
+    [[ "$NOTIFY" =~ ^[01]$ ]] || die "YTWS_NOTIFY must be 0 or 1"
+    case "$MIRROR_BACKEND" in
+    auto|extcopy-dmabuf|extcopy-shm|screencopy-dmabuf|screencopy-shm|export-dmabuf)
+        ;;
+    *)
+        die "YTWS_MIRROR_BACKEND is not a supported wl-mirror backend"
+        ;;
+    esac
 }
 
 pid_is_alive() {
@@ -80,33 +154,24 @@ pid_is_alive() {
     [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null
 }
 
-output_exists() {
-    hyprctl -j monitors | jq -e --arg output "$OUTPUT" \
-        'any(.[]; .name == $output)' >/dev/null
-}
+pid_is_command() {
+    local pid="${1:-}"
+    local expected="${2:-}"
+    local executable
 
-workspace_exists() {
-    local workspace="$1"
-    hyprctl -j workspaces | jq -e --argjson workspace "$workspace" \
-        'any(.[]; .id == $workspace)' >/dev/null
-}
-
-workspace_on_output() {
-    local workspace="$1"
-    local output="$2"
-    hyprctl -j workspaces | jq -e --argjson workspace "$workspace" --arg output "$output" \
-        'any(.[]; .id == $workspace and .monitor == $output)' >/dev/null
+    pid_is_alive "$pid" || return 1
+    executable="$(readlink -f "/proc/$pid/exe" 2>/dev/null)" || return 1
+    [[ "${executable##*/}" == "$expected" ]]
 }
 
 wait_until() {
     local description="$1"
     shift
-    local attempt
-    for attempt in $(seq 1 100); do
+    for _ in $(seq 1 100); do
         if "$@"; then
             return 0
         fi
-        sleep 0.05
+        sleep 0.03
     done
     die "timed out waiting for $description"
 }
@@ -116,49 +181,215 @@ port_is_listening() {
     ss -H -ltn | awk -v suffix=":$port" '$4 ~ suffix "$" { found=1 } END { exit !found }'
 }
 
-first_physical_monitor() {
-    hyprctl -j monitors | jq -r --arg output "$OUTPUT" \
-        '[.[] | select(.name != $output)] | sort_by(.x, .y) | .[0].name // empty'
+# Start a GUI helper outside the caller's process tree and print its PID.
+# Hyprland's window swallowing hides a terminal behind any window started
+# from it; a helper reparented away from the terminal never swallows it.
+spawn_detached() {
+    local log="$1"
+    shift
+    (setsid "$@" </dev/null >"$log" 2>&1 & printf '%s\n' "$!")
 }
 
+stop_pid() {
+    local pid="${1:-}" name="$2"
+    pid_is_command "$pid" "$name" || return 0
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+        pid_is_alive "$pid" || return 0
+        sleep 0.02
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+# --- Hyprland module --------------------------------------------------------
+
+lua_quote() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '"%s"' "$s"
+}
+
+# Evaluate Lua inside Hyprland and print what it returns.
+hypr_call() {
+    local result
+    result="$(hyprctl repl "$1" 2>&1)" || {
+        printf '%s\n' "$result" >&2
+        return 1
+    }
+    [[ "$result" != error:* ]] || {
+        printf '%s\n' "$result" >&2
+        return 1
+    }
+    printf '%s\n' "$result"
+}
+
+# hyprctl reports "cannot connect" on stdout, so only a number is an answer.
+module_protocol() {
+    local protocol
+    protocol="$(hyprctl repl 'return YTWS and YTWS.protocol or 0' 2>/dev/null)" || protocol=""
+    if [[ "$protocol" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$protocol"
+    else
+        printf '0\n'
+    fi
+}
+
+module_path() {
+    local candidate
+    for candidate in \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/hypr/yt-stream-workspace.lua" \
+        "${SELF%/bin/*}/hyprland/yt-stream-workspace.lua"; do
+        [[ -r "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+# A shell that did not start inside Hyprland (ssh, a service) has neither the
+# instance signature nor the Wayland socket name. Take them from the running
+# instance; with several it would be a guess. A signature taken here brings its
+# own socket: a WAYLAND_DISPLAY from elsewhere (waypipe) is another compositor.
+adopt_hyprland_instance() {
+    [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" || -z "${WAYLAND_DISPLAY:-}" ]] || return 0
+    command -v hyprctl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 0
+    local instances picked signature socket
+    instances="$(hyprctl instances -j 2>/dev/null)" || return 0
+    picked="$(jq -r --arg signature "${HYPRLAND_INSTANCE_SIGNATURE:-}" '
+        [.[] | select($signature == "" or .instance == $signature)]
+        | if length == 1 then .[0] | "\(.instance)\t\(.wl_socket // "")" else empty end
+    ' <<<"$instances" 2>/dev/null)" || return 0
+    [[ -n "$picked" ]] || return 0
+    IFS=$'\t' read -r signature socket <<<"$picked"
+    [[ -z "$socket" ]] || export WAYLAND_DISPLAY="$socket"
+    export HYPRLAND_INSTANCE_SIGNATURE="$signature"
+}
+
+require_hyprland() {
+    [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] ||
+        die "HYPRLAND_INSTANCE_SIGNATURE is not set and there is not exactly one running Hyprland to use; run this inside the Hyprland session"
+    hyprctl version >/dev/null 2>&1 ||
+        die "cannot reach Hyprland (instance $HYPRLAND_INSTANCE_SIGNATURE); is it running?"
+}
+
+ensure_module() {
+    require_hyprland
+    local protocol
+    protocol="$(module_protocol)"
+    if [[ "$protocol" == "$PROTOCOL" ]]; then
+        return 0
+    fi
+    if [[ "$protocol" == 0 ]]; then
+        die "Hyprland has not loaded yt-stream-workspace.lua; add require(\"yt-stream-workspace\") to hyprland.lua and run 'hyprctl reload'"
+    fi
+    die "Hyprland runs yt-stream-workspace.lua protocol $protocol but this command needs $PROTOCOL; update the module and run 'hyprctl reload'"
+}
+
+json_field() {
+    jq -r --arg field "$2" '.[$field] // empty' <<<"$1"
+}
+
+write_intent() {
+    umask 077
+    {
+        printf 'return {\n'
+        printf '    protocol = %s,\n' "$PROTOCOL"
+        printf '    output = %s,\n' "$(lua_quote "$OUTPUT")"
+        printf '    workspace = %s,\n' "$WORKSPACE"
+        printf '    mode = %s,\n' "$(lua_quote "${WIDTH}x${HEIGHT}@${FPS}")"
+        printf '    scale = %s,\n' "$SCALE"
+        printf '    preview_monitor = %s,\n' "$(lua_quote "$PREVIEW_MONITOR")"
+        printf '    stream_layers = %s,\n' "$(lua_quote "($STREAM_LAYERS)")"
+        printf '    private_windows = %s,\n' "$(lua_quote "${PRIVATE_WINDOWS:+($PRIVATE_WINDOWS)}")"
+        printf '    mix_sink = %s,\n' "$(lua_quote "$MIX_SINK")"
+        printf '}\n'
+    } >"$SESSION_FILE"
+}
+
+phase_is() {
+    local phase=""
+    [[ -r "$PHASE_FILE" ]] && read -r phase <"$PHASE_FILE"
+    [[ "$phase" == "$1" ]]
+}
+
+# --- compositor queries -----------------------------------------------------
+
+output_exists() {
+    hyprctl -j monitors | jq -e --arg output "$OUTPUT" \
+        'any(.[]; .name == $output)' >/dev/null
+}
+
+output_matches_config() {
+    hyprctl -j monitors | jq -e \
+        --arg output "$OUTPUT" \
+        --argjson width "$WIDTH" \
+        --argjson height "$HEIGHT" \
+        --argjson fps "$FPS" \
+        --argjson scale "$SCALE" \
+        'any(.[];
+            .name == $output and
+            .width == $width and
+            .height == $height and
+            ((.refreshRate - $fps) | fabs) < 0.1 and
+            ((.scale - $scale) | fabs) < 0.001
+        )' >/dev/null
+}
+
+output_absent() {
+    ! output_exists
+}
+
+preview_window_mapped() {
+    hyprctl -j clients | jq -e --argjson pid "$MIRROR_PID" --arg title "$PREVIEW_TITLE" \
+        'any(.[]; .pid == $pid and .title == $title and .mapped)' >/dev/null
+}
+
+# --- session state ----------------------------------------------------------
+
 load_state() {
-    [[ -r "$STATE_FILE" ]] || die "no prepared stream session; run '$SELF start' first"
+    [[ -r "$STATE_FILE" ]] || die "no prepared stream session; run 'workspace-stream start' first"
     # The state file is mode 600 in a mode 700 per-user runtime directory.
     # shellcheck disable=SC1090
     source "$STATE_FILE"
 }
 
 write_state() {
-    mkdir -p "$STATE_DIR"
-    chmod 700 "$STATE_DIR"
+    mkdir -p "$RUN_DIR"
+    chmod 700 "$RUN_DIR"
     umask 077
     {
+        # Snapshot session-defining config so later edits cannot strand resources.
+        printf 'OUTPUT=%q\n' "$OUTPUT"
+        printf 'WIDTH=%q\n' "$WIDTH"
+        printf 'HEIGHT=%q\n' "$HEIGHT"
+        printf 'FPS=%q\n' "$FPS"
+        printf 'SCALE=%q\n' "$SCALE"
+        printf 'VIDEO_BITRATE=%q\n' "$VIDEO_BITRATE"
+        printf 'VIDEO_MAXRATE=%q\n' "$VIDEO_MAXRATE"
+        printf 'VIDEO_BUFSIZE=%q\n' "$VIDEO_BUFSIZE"
+        printf 'VIDEO_GOP=%q\n' "$VIDEO_GOP"
+        printf 'AUDIO_BITRATE=%q\n' "$AUDIO_BITRATE"
+        printf 'TEST_RTMP_PORT=%q\n' "$TEST_RTMP_PORT"
+        printf 'YOUTUBE_RTMPS_URL=%q\n' "$YOUTUBE_RTMPS_URL"
+        printf 'MIX_SINK=%q\n' "$MIX_SINK"
+        printf 'DESKTOP_AUDIO=%q\n' "$DESKTOP_AUDIO"
+        printf 'MIC=%q\n' "$MIC"
+        printf 'RECORDER=%q\n' "${RECORDER:-}"
+        printf 'RECORDER_PATCHED=%q\n' "${RECORDER_PATCHED:-0}"
+        printf 'PREVIEW_COMMAND=%q\n' "${PREVIEW_COMMAND:-}"
+        printf 'MIRROR_BACKEND=%q\n' "$MIRROR_BACKEND"
+        printf 'WALLPAPER=%q\n' "$WALLPAPER"
+        printf 'NOTIFY=%q\n' "$NOTIFY"
+        printf 'LOG_DIR=%q\n' "$LOG_DIR"
+        printf 'SIGNATURE=%q\n' "${SIGNATURE:-}"
         printf 'WORKSPACE=%q\n' "${WORKSPACE:-}"
-        printf 'ORIGINAL_MONITOR=%q\n' "${ORIGINAL_MONITOR:-}"
-        printf 'VIEWER_WORKSPACE=%q\n' "${VIEWER_WORKSPACE:-}"
-        printf 'RETURN_WORKSPACE=%q\n' "${RETURN_WORKSPACE:-}"
-        printf 'ORIGINAL_SINK=%q\n' "${ORIGINAL_SINK:-}"
-        printf 'ORIGINAL_SOURCE=%q\n' "${ORIGINAL_SOURCE:-}"
-        printf 'PREEXISTING_INPUTS=%q\n' "${PREEXISTING_INPUTS:-}"
+        printf 'PREVIEW_ON=%q\n' "${PREVIEW_ON:-}"
         printf 'NULL_MODULE=%q\n' "${NULL_MODULE:-}"
-        printf 'COMBINE_MODULE=%q\n' "${COMBINE_MODULE:-}"
-        printf 'LOOPBACK_MODULE=%q\n' "${LOOPBACK_MODULE:-}"
-        printf 'MIRROR_PID=%q\n' "${MIRROR_PID:-}"
-        printf 'WALLPAPER_PID=%q\n' "${WALLPAPER_PID:-}"
-        printf 'LIVE_PID=%q\n' "${LIVE_PID:-}"
+        printf 'SUPERVISOR_PID=%q\n' "${SUPERVISOR_PID:-}"
         printf 'VAAPI_DEVICE=%q\n' "${VAAPI_DEVICE:-}"
     } >"$STATE_FILE"
 }
 
-wait_for_output() {
-    output_exists
-}
-
-client_pid_exists() {
-    local pid="$1"
-    hyprctl -j clients | jq -e --argjson pid "$pid" \
-        'any(.[]; .pid == $pid)' >/dev/null
-}
+# --- encoder ----------------------------------------------------------------
 
 vaapi_device_works() {
     local device="$1"
@@ -198,47 +429,33 @@ detect_vaapi_device() {
     die "no VAAPI render node can encode H.264; set YTWS_VAAPI_DEVICE if auto-detection missed it"
 }
 
+# --- audio ------------------------------------------------------------------
+#
+# Viewers hear the null sink $MIX_SINK. While something is recorded, the
+# output device's monitor and the microphone are linked into it with plain
+# PipeWire links: nothing is rerouted, the user's own audio is untouched, and
+# between recordings there is no link at all, so the microphone stays closed
+# and no sound is processed for the stream.
+
 audio_start() {
-    local input
-
-    ORIGINAL_SINK="$(pactl get-default-sink)"
-    ORIGINAL_SOURCE="$(pactl get-default-source)"
-    PREEXISTING_INPUTS="$(
-        pactl list short sink-inputs | awk '{print $1}' | paste -sd' ' -
-    )"
-
     NULL_MODULE="$(
         pactl load-module module-null-sink \
             sink_name="$MIX_SINK" \
             sink_properties=device.description=YouTube_Stream_Mix \
             rate=48000 channels=2
     )"
-    COMBINE_MODULE="$(
-        pactl load-module module-combine-sink \
-            sink_name="$OUTPUT_SINK" \
-            sink_properties=device.description=YouTube_Stream_Output \
-            sinks="$ORIGINAL_SINK,$MIX_SINK" \
-            rate=48000 channels=2
-    )"
-    LOOPBACK_MODULE="$(
-        pactl load-module module-loopback \
-            source="$ORIGINAL_SOURCE" sink="$MIX_SINK" latency_msec=20
-    )"
-
-    pactl set-default-sink "$OUTPUT_SINK"
-    for input in $PREEXISTING_INPUTS; do
-        pactl move-sink-input "$input" "$OUTPUT_SINK" 2>/dev/null || true
-    done
 }
 
+# Unloading the mix also removes every link into it.
 audio_stop() {
-    local stream_sink_id input
+    local stream_sink_id input module
 
+    # Sessions from before the link-based mix moved the default sink.
     if [[ -n "${ORIGINAL_SINK:-}" ]]; then
         pactl set-default-sink "$ORIGINAL_SINK" 2>/dev/null || true
         stream_sink_id="$(
             pactl list short sinks 2>/dev/null |
-                awk -v name="$OUTPUT_SINK" '$2 == name {print $1; exit}'
+                awk -v name="${OUTPUT_SINK:-yt_stream_output}" '$2 == name {print $1; exit}'
         )"
         if [[ -n "$stream_sink_id" ]]; then
             while read -r input; do
@@ -251,19 +468,152 @@ audio_stop() {
         fi
     fi
 
-    [[ -n "${LOOPBACK_MODULE:-}" ]] &&
-        pactl unload-module "$LOOPBACK_MODULE" 2>/dev/null || true
-    [[ -n "${COMBINE_MODULE:-}" ]] &&
-        pactl unload-module "$COMBINE_MODULE" 2>/dev/null || true
-    [[ -n "${NULL_MODULE:-}" ]] &&
-        pactl unload-module "$NULL_MODULE" 2>/dev/null || true
+    for module in "${LOOPBACK_MODULE:-}" "${COMBINE_MODULE:-}" "${NULL_MODULE:-}"; do
+        [[ -n "$module" ]] || continue
+        pactl unload-module "$module" 2>/dev/null || true
+    done
+}
+
+# The PipeWire node a desktop-audio or microphone setting names right now.
+audio_node() {
+    local setting="$1" kind="$2" node
+    case "$setting" in
+    none) return 0 ;;
+    default) node="$(pactl "get-default-$kind" 2>/dev/null)" || return 0 ;;
+    *) node="$setting" ;;
+    esac
+    # A sink's monitor, in PulseAudio spelling, is the sink's monitor ports.
+    node="${node%.monitor}"
+    [[ -n "$node" && "$node" != "$MIX_SINK" ]] && printf '%s\n' "$node"
+    return 0
+}
+
+# "OUT<TAB>IN" links that feed NODE into the mix: matching channels, a mono
+# node into both sides, anything else by position. Reads the caller's
+# OUTPUT_PORTS; fails if the node has no ports.
+audio_pairs() {
+    local node="$1" port matched=0
+    local -a ports=()
+    for port in "${OUTPUT_PORTS[@]}"; do
+        [[ "$port" == "$node:"* ]] && ports+=("$port")
+    done
+    case "${#ports[@]}" in
+    0) return 1 ;;
+    1)
+        printf '%s\t%s\n' "${ports[0]}" "$MIX_SINK:playback_FL" "${ports[0]}" "$MIX_SINK:playback_FR"
+        return 0
+        ;;
+    esac
+    for port in "${ports[@]}"; do
+        case "${port##*_}" in
+        FL|FR)
+            printf '%s\t%s\n' "$port" "$MIX_SINK:playback_${port##*_}"
+            matched=1
+            ;;
+        esac
+    done
+    (( matched )) ||
+        printf '%s\t%s\n' "${ports[0]}" "$MIX_SINK:playback_FL" "${ports[1]}" "$MIX_SINK:playback_FR"
+}
+
+declare -A AUDIO_LINKS=()
+AUDIO_DESCRIPTION=""
+
+# Link what viewers should hear into the mix and drop the links this process
+# made that are no longer wanted. Safe to repeat: existing links stay.
+audio_link_sync() {
+    local -A want=()
+    local -a OUTPUT_PORTS=() parts=()
+    local kind setting node pair pairs
+    mapfile -t OUTPUT_PORTS < <(pw-link -o 2>/dev/null)
+    for kind in desktop microphone; do
+        if [[ "$kind" == desktop ]]; then
+            setting="$DESKTOP_AUDIO"
+            node="$(audio_node "$DESKTOP_AUDIO" sink)"
+        else
+            setting="$MIC"
+            node="$(audio_node "$MIC" source)"
+        fi
+        if [[ -z "$node" && "$setting" == none ]]; then
+            parts+=("$kind off")
+        elif [[ -z "$node" ]]; then
+            parts+=("$kind unavailable")
+        elif pairs="$(audio_pairs "$node")"; then
+            while IFS= read -r pair; do want[$pair]=1; done <<<"$pairs"
+            parts+=("$kind $node")
+        else
+            parts+=("$kind $node (not found)")
+        fi
+    done
+    AUDIO_DESCRIPTION="${parts[0]}, ${parts[1]}"
+
+    for pair in "${!AUDIO_LINKS[@]}"; do
+        [[ -n "${want[$pair]:-}" ]] && continue
+        pw-link -d "${pair%%$'\t'*}" "${pair#*$'\t'}" >/dev/null 2>&1 || true
+        unset 'AUDIO_LINKS[$pair]'
+    done
+    for pair in "${!want[@]}"; do
+        # Fails harmlessly for a link that exists already.
+        pw-link "${pair%%$'\t'*}" "${pair#*$'\t'}" >/dev/null 2>&1 || true
+        AUDIO_LINKS[$pair]=1
+    done
+}
+
+audio_unlink_all() {
+    local pair
+    for pair in "${!AUDIO_LINKS[@]}"; do
+        pw-link -d "${pair%%$'\t'*}" "${pair#*$'\t'}" >/dev/null 2>&1 || true
+    done
+    AUDIO_LINKS=()
+}
+
+# --- recorder ---------------------------------------------------------------
+
+# Which wf-recorder to run, and whether it carries recorder/patches.
+resolve_recorder() {
+    RECORDER="$CONFIGURED_RECORDER"
+    if [[ -z "$RECORDER" && -x "$NATIVE_BIN/wf-recorder" ]]; then
+        RECORDER="$NATIVE_BIN/wf-recorder"
+    fi
+    if [[ "${RECORDER:-wf-recorder}" != */* ]]; then
+        RECORDER="$(command -v "${RECORDER:-wf-recorder}")" ||
+            die "wf-recorder is not installed; native/build.sh builds the patched one"
+    fi
+    [[ -x "$RECORDER" ]] || die "YTWS_RECORDER is not an executable: $RECORDER"
+    RECORDER_PATCHED=0
+    if [[ "$("$RECORDER" --help 2>&1)" == *--cfr* ]]; then
+        RECORDER_PATCHED=1
+    fi
+}
+
+# Which preview client to run: ytws-preview from native/build.sh, which hands
+# captured frames to Hyprland without copying them and is idle while hidden or
+# while the stream does not change, else wl-mirror.
+resolve_preview() {
+    PREVIEW_COMMAND="$CONFIGURED_PREVIEW"
+    if [[ -z "$PREVIEW_COMMAND" && -x "$NATIVE_BIN/ytws-preview" ]]; then
+        PREVIEW_COMMAND="$NATIVE_BIN/ytws-preview"
+    fi
+    if [[ "${PREVIEW_COMMAND:-wl-mirror}" != */* ]]; then
+        PREVIEW_COMMAND="$(command -v "${PREVIEW_COMMAND:-wl-mirror}")" ||
+            die "no preview client: install wl-mirror, or build ytws-preview with native/build.sh"
+    fi
+    [[ -x "$PREVIEW_COMMAND" ]] || die "YTWS_PREVIEW is not an executable: $PREVIEW_COMMAND"
 }
 
 wf_recorder_args() {
     : "${VAAPI_DEVICE:?VAAPI_DEVICE is not set}"
-    WF_ARGS=(
-        -o "$OUTPUT"
-        --no-damage
+    WF_ARGS=(-o "$OUTPUT")
+    if [[ "${RECORDER_PATCHED:-0}" == 1 ]]; then
+        # Captures only when the stream changes and repeats the last frame to
+        # keep the rate constant; the audio is the mix node and nothing else.
+        WF_ARGS+=(--cfr --audio-backend=pipewire "--audio=$MIX_SINK")
+    else
+        # Stock wf-recorder gets a constant rate only by making Hyprland
+        # redraw the output for every frame.
+        WF_ARGS+=(--no-damage "--audio=$MIX_SINK.monitor")
+    fi
+    WF_ARGS+=(
         -r "$FPS"
         -c h264_vaapi
         -d "$VAAPI_DEVICE"
@@ -274,238 +624,652 @@ wf_recorder_args() {
         -p "g=$VIDEO_GOP"
         -p profile=high
         -b 2
-        "--audio=$MIX_SINK.monitor"
         -C aac
         -P "b=$AUDIO_BITRATE"
         -R 48000
     )
 }
 
-start_session() {
-    validate_config
-    require_commands hyprctl jq pactl wl-mirror wf-recorder ffmpeg ss
-    [[ ! -e "$STATE_FILE" ]] || die "a stream session is already prepared"
-    output_exists && die "Hyprland output '$OUTPUT' already exists"
-
-    WORKSPACE="${1:-$(hyprctl -j activeworkspace | jq -r '.id')}"
-    [[ "$WORKSPACE" =~ ^[1-9][0-9]*$ ]] ||
-        die "workspace must be a positive numeric Hyprland workspace"
-    if ! workspace_exists "$WORKSPACE"; then
-        hyprctl dispatch workspace "$WORKSPACE" >/dev/null
-        wait_until "workspace $WORKSPACE creation" workspace_exists "$WORKSPACE"
-    fi
-
-    ORIGINAL_MONITOR="$(
-        hyprctl -j workspaces | jq -r --argjson workspace "$WORKSPACE" \
-            '.[] | select(.id == $workspace) | .monitor'
+# WirePlumber remembers a capture stream's mute by application name, so one
+# recording muted from a mixer would silence every later one. Force ours open.
+unmute_capture() {
+    local index
+    index="$(
+        pactl -f json list source-outputs 2>/dev/null | jq -r --arg pid "$1" \
+            'first(.[] | select(.properties["application.process.id"] == $pid) | .index) // empty'
     )"
-    [[ -n "$ORIGINAL_MONITOR" ]] || die "could not determine the workspace's monitor"
-
-    ORIGINAL_SINK=""
-    ORIGINAL_SOURCE=""
-    PREEXISTING_INPUTS=""
-    NULL_MODULE=""
-    COMBINE_MODULE=""
-    LOOPBACK_MODULE=""
-    MIRROR_PID=""
-    WALLPAPER_PID=""
-    LIVE_PID=""
-    VAAPI_DEVICE=""
-    detect_vaapi_device
-
-    mkdir -p "$STATE_DIR"
-    chmod 700 "$STATE_DIR"
-    write_state
-
-    local completed=0
-    trap 'if (( ! completed )); then stop_session_internal; fi' EXIT
-
-    hyprctl output create headless "$OUTPUT" >/dev/null
-    wait_until "headless output" wait_for_output
-    hyprctl keyword monitor \
-        "$OUTPUT,${WIDTH}x${HEIGHT}@${FPS},auto-right,$SCALE" >/dev/null
-    sleep 0.2
-
-    hyprctl dispatch moveworkspacetomonitor \
-        "$WORKSPACE $OUTPUT" >/dev/null
-    wait_until "workspace move" workspace_on_output "$WORKSPACE" "$OUTPUT"
-
-    VIEWER_WORKSPACE="$(
-        hyprctl -j monitors | jq -r --arg monitor "$ORIGINAL_MONITOR" \
-            '.[] | select(.name == $monitor) | .activeWorkspace.id'
-    )"
-    [[ "$VIEWER_WORKSPACE" =~ ^[1-9][0-9]*$ ]] ||
-        die "could not find a physical workspace for the output mirror"
-    RETURN_WORKSPACE="$VIEWER_WORKSPACE"
-
-    if command -v swaybg >/dev/null 2>&1 && [[ -f "$WALLPAPER" ]]; then
-        swaybg -o "$OUTPUT" -i "$WALLPAPER" \
-            >"$STATE_DIR/swaybg.log" 2>&1 &
-        WALLPAPER_PID=$!
-    fi
-
-    audio_start
-    write_state
-
-    wl-mirror --fullscreen-output "$ORIGINAL_MONITOR" --show-cursor \
-        --scaling fit --title YT-Stream-Preview "$OUTPUT" \
-        >"$STATE_DIR/wl-mirror.log" 2>&1 &
-    MIRROR_PID=$!
-    write_state
-    wait_until "wl-mirror window" client_pid_exists "$MIRROR_PID"
-
-    hyprctl dispatch movetoworkspacesilent \
-        "$VIEWER_WORKSPACE,pid:$MIRROR_PID" >/dev/null
-    hyprctl dispatch focuswindow "pid:$MIRROR_PID" >/dev/null
-
-    completed=1
-    trap - EXIT
-    note "workspace $WORKSPACE is isolated on $OUTPUT"
-    note "the fullscreen mirror is on workspace $VIEWER_WORKSPACE"
-    note "capture will use $OUTPUT at ${WIDTH}x${HEIGHT}@${FPS}, scale $SCALE"
-    note "SUPER+F11 controls the stream; SUPER+F12 returns to $ORIGINAL_MONITOR"
-    note "run '$SELF test' before going live"
+    [[ -n "$index" ]] || return 1
+    pactl set-source-output-mute "$index" 0 && pactl set-source-output-volume "$index" 100%
 }
 
-stop_live_internal() {
-    if pid_is_alive "${LIVE_PID:-}"; then
-        kill -INT "$LIVE_PID" 2>/dev/null || true
-        local attempt
-        for attempt in $(seq 1 50); do
-            pid_is_alive "$LIVE_PID" || break
-            sleep 0.1
+# --- session lifecycle ------------------------------------------------------
+
+# A state file left behind by an earlier Hyprland instance describes nothing
+# that still exists in this compositor; release its audio modules and drop it.
+discard_stale_session() {
+    [[ -r "$STATE_FILE" ]] || return 0
+    local current="${HYPRLAND_INSTANCE_SIGNATURE:-}"
+    (
+        load_state
+        [[ -n "${SIGNATURE:-}" && "$SIGNATURE" != "$current" ]] || exit 3
+        audio_stop
+    ) && {
+        rm -rf "$RUN_DIR"
+        note "discarded a session left by an earlier Hyprland instance"
+        return 0
+    }
+    die "a stream session is already prepared; run 'workspace-stream stop' first"
+}
+
+load_status() {
+    MIRROR_STATE="" MIRROR_PID="" MIRROR_RESTARTS=0 WALLPAPER_PID=""
+    LIVE_STATE="" LIVE_PID="" LIVE_SINCE="" LIVE_RECONNECTS=0 LIVE_KBPS=0 LIVE_ERROR=""
+    AUDIO_WATCH_PID="" AUDIO_DESCRIPTION=""
+    if [[ -r "$STATUS_FILE" ]]; then
+        # Written by this session's supervisor in the private runtime directory.
+        # shellcheck disable=SC1090
+        source "$STATUS_FILE"
+    fi
+}
+
+supervisor_alive() {
+    local pid="${SUPERVISOR_PID:-}" arg
+    pid_is_alive "$pid" || return 1
+    local -a cmdline=()
+    mapfile -d '' cmdline <"/proc/$pid/cmdline" 2>/dev/null || return 1
+    for arg in "${cmdline[@]}"; do
+        [[ "$arg" == _supervise ]] && return 0
+    done
+    return 1
+}
+
+supervisor_ready() {
+    load_status
+    [[ "$MIRROR_STATE" == up && -n "$MIRROR_PID" ]]
+}
+
+# Send one command line to the supervisor and wait for its answer.
+supervisor_send() {
+    local seq="$$.$RANDOM" fd rseq message
+    { supervisor_alive && [[ -p "$CONTROL_FIFO" ]]; } ||
+        die "the session supervisor is not running; run 'workspace-stream stop' and start again"
+    exec {fd}<>"$CONTROL_FIFO"
+    printf '%s %s\n' "$seq" "$*" >&"$fd"
+    exec {fd}>&-
+    for _ in $(seq 1 200); do
+        if [[ -r "$REPLY_FILE" ]] && read -r rseq message <"$REPLY_FILE" && [[ "$rseq" == "$seq" ]]; then
+            SUPERVISOR_REPLY="$message"
+            [[ "$message" == ok* ]]
+            return
+        fi
+        sleep 0.05
+    done
+    die "the session supervisor did not answer"
+}
+
+stop_supervisor() {
+    if supervisor_alive; then
+        kill -TERM "$SUPERVISOR_PID" 2>/dev/null || true
+        for _ in $(seq 1 200); do
+            supervisor_alive || break
+            sleep 0.05
         done
-        pid_is_alive "$LIVE_PID" && kill "$LIVE_PID" 2>/dev/null || true
+        supervisor_alive && kill -KILL "$SUPERVISOR_PID" 2>/dev/null
     fi
-    LIVE_PID=""
+    # Whatever a supervisor that died left behind.
+    load_status
+    stop_pid "$LIVE_PID" wf-recorder
+    stop_pid "$MIRROR_PID" "$(preview_name)"
+    stop_pid "$WALLPAPER_PID" swaybg
+    stop_pid "$AUDIO_WATCH_PID" pactl
+    # Sessions started before the supervisor recorded helpers in the state.
+    stop_pid "${STATE_MIRROR_PID:-}" wl-mirror
+    stop_pid "${STATE_LIVE_PID:-}" wf-recorder
 }
 
-stop_session_internal() {
-    stop_live_internal
-
-    if pid_is_alive "${MIRROR_PID:-}"; then
-        kill "$MIRROR_PID" 2>/dev/null || true
-    fi
-    if pid_is_alive "${WALLPAPER_PID:-}"; then
-        kill "$WALLPAPER_PID" 2>/dev/null || true
-    fi
-
+abort_start() {
+    note "start failed; restoring the desktop"
+    stop_supervisor
     audio_stop
-
-    if [[ -n "${WORKSPACE:-}" ]] && workspace_exists "$WORKSPACE"; then
-        local restore_monitor="${ORIGINAL_MONITOR:-}"
-        if [[ -z "$restore_monitor" ]] ||
-           ! hyprctl -j monitors | jq -e --arg monitor "$restore_monitor" \
-                'any(.[]; .name == $monitor)' >/dev/null; then
-            restore_monitor="$(first_physical_monitor)"
-        fi
-        if [[ -n "$restore_monitor" ]]; then
-            hyprctl dispatch moveworkspacetomonitor \
-                "$WORKSPACE $restore_monitor" >/dev/null 2>&1 || true
-        fi
-    fi
+    hypr_call 'return YTWS and YTWS.finish() or ""' >/dev/null 2>&1 || true
     if output_exists; then
         hyprctl output remove "$OUTPUT" >/dev/null 2>&1 || true
     fi
+    rm -rf "$RUN_DIR"
+}
 
-    rm -rf "$STATE_DIR"
+start_session() {
+    validate_config
+    require_commands hyprctl jq pactl pw-link ffmpeg ss setsid
+    resolve_recorder
+    resolve_preview
+    # Without a signature every state file would look like an earlier
+    # instance's, and a live session would be discarded.
+    require_hyprland
+    discard_stale_session
+    ensure_module
+    output_exists && die "Hyprland output '$OUTPUT' already exists"
+
+    detect_vaapi_device
+    WORKSPACE="${1:-$(hypr_call 'return hl.get_active_workspace().id')}"
+    [[ "$WORKSPACE" =~ ^[1-9][0-9]*$ ]] ||
+        die "workspace must be a positive numeric Hyprland workspace"
+
+    SIGNATURE="${HYPRLAND_INSTANCE_SIGNATURE:-}"
+    NULL_MODULE="" SUPERVISOR_PID="" PREVIEW_ON=""
+
+    mkdir -p "$RUN_DIR" "$LOG_DIR"
+    chmod 700 "$RUN_DIR" "$LOG_DIR"
+    write_intent
+    write_state
+    trap abort_start EXIT
+
+    local result
+    result="$(hypr_call 'return YTWS.begin()')" || die "Hyprland rejected the session"
+    [[ "$(json_field "$result" ok)" == true ]] ||
+        die "Hyprland rejected the session: $(json_field "$result" error)"
+    PREVIEW_ON="$(json_field "$result" preview_monitor)"
+    write_state
+
+    hyprctl output create headless "$OUTPUT" >/dev/null
+    wait_until "headless output" output_exists
+    if ! phase_is active; then
+        hypr_call 'return YTWS.activate()' >/dev/null
+    fi
+    wait_until "stream workspace activation" phase_is active
+    wait_until "configured output mode" output_matches_config
+
+    audio_start
+    # WirePlumber restores a sink's volume and mute by name, so a session that
+    # ended with the curtain up would otherwise start silent.
+    if ! { pactl set-sink-mute "$MIX_SINK" 0 && pactl set-sink-volume "$MIX_SINK" 100% &&
+           pactl set-source-mute "$MIX_SINK.monitor" 0 &&
+           pactl set-source-volume "$MIX_SINK.monitor" 100%; }; then
+        die "could not reset the stream mix volume"
+    fi
+    write_state
+
+    SUPERVISOR_PID="$(spawn_detached "$LOG_DIR/supervisor.log" "$SELF" _supervise)"
+    write_state
+    wait_until "session supervisor" supervisor_ready
+    wait_until "preview window" preview_window_mapped
+
+    trap - EXIT
+    note "workspace $WORKSPACE is isolated on $OUTPUT (${WIDTH}x${HEIGHT}@${FPS}, scale $SCALE)"
+    note "the preview is on $PREVIEW_ON; Super+F11 works in the stream, Super+F12 returns"
+    note "Super+F10 raises the curtain; run 'workspace-stream test' before going live"
+}
+
+stop_session_internal() {
+    stop_supervisor
+    audio_stop
+
+    if [[ "$(module_protocol)" == "$PROTOCOL" ]]; then
+        hypr_call 'return YTWS.finish()' >/dev/null || true
+    elif output_exists; then
+        # Without the module, at least bring the workspace home before the
+        # output disappears and Hyprland picks a monitor for it.
+        hyprctl dispatch "hl.dsp.workspace.move({ workspace = \"$WORKSPACE\", monitor = \"${PREVIEW_ON:-${ORIGINAL_MONITOR:-}}\" })" \
+            >/dev/null 2>&1 || true
+    fi
+
+    if output_exists; then
+        hyprctl output remove "$OUTPUT" >/dev/null 2>&1 || true
+        for _ in $(seq 1 100); do
+            output_exists || break
+            sleep 0.03
+        done
+        if output_exists; then
+            note "could not remove stream output '$OUTPUT'; preserving state for recovery"
+            return 1
+        fi
+    fi
+    rm -rf "$RUN_DIR"
 }
 
 stop_session() {
     load_state
+    # Sessions started before the supervisor kept helper PIDs in the state.
+    STATE_MIRROR_PID="${MIRROR_PID:-}" STATE_LIVE_PID="${LIVE_PID:-}"
     stop_session_internal
-    note "workspace, audio, mirror, and virtual output restored"
+    note "workspace, audio, preview, and virtual output restored"
 }
 
-focus_monitor_center() {
-    local monitor="$1"
-    local geometry x y width height
-    geometry="$(
-        hyprctl -j monitors | jq -r --arg monitor "$monitor" \
-            '.[] | select(.name == $monitor) |
-             "\(.x) \(.y) \(.width) \(.height)"'
-    )"
-    [[ -n "$geometry" ]] || die "monitor '$monitor' is unavailable"
-    read -r x y width height <<<"$geometry"
-    hyprctl dispatch focusmonitor "$monitor" >/dev/null
-    hyprctl dispatch movecursor \
-        "$((x + width / 2)) $((y + height / 2))" >/dev/null
+# --- supervisor -------------------------------------------------------------
+#
+# Each session has one detached supervisor that owns the preview and live
+# delivery. It restarts a preview that dies, reconnects YouTube with backoff,
+# notices a connection that has stalled, keeps the recorder's audio capture
+# open, and records what it sees in $RUN_DIR/status. Commands arrive as
+# "SEQ COMMAND [ARGUMENT]" lines on the $RUN_DIR/control FIFO, so the stream
+# key never appears in a command line or a file; answers go to
+# $RUN_DIR/reply. Every check is a shell builtin: an idle tick forks nothing.
+
+LIVE_CONNECTED_BYTES="${YTWS_LIVE_CONNECTED_BYTES:-262144}"         # acknowledged before an attempt counts as connected
+LIVE_ESTABLISHED_SECONDS="${YTWS_LIVE_ESTABLISHED_SECONDS:-10}"     # connected this long: YouTube accepted it
+LIVE_STALL_SECONDS="${YTWS_LIVE_STALL_SECONDS:-10}"                 # connected but nothing acknowledged this long: dead
+LIVE_CONNECT_SECONDS="${YTWS_LIVE_CONNECT_SECONDS:-20}"             # not connected by now: the attempt failed
+LIVE_REFUSED_LIMIT=3        # attempts in a row that never establish
+MIRROR_RESTART_LIMIT=5      # preview restarts within a minute before giving up
+
+# Sleep without forking and without reading the command FIFO, so commands
+# that arrive while the supervisor waits stay queued for the main loop.
+sup_sleep() {
+    read -r -t "$1" -u "$SUP_SLEEP" _ || true
 }
 
-enter_stream() {
+notify_user() {
+    [[ "$NOTIFY" == 1 ]] && command -v notify-send >/dev/null 2>&1 || return 0
+    notify-send -a "YouTube stream" "$@" >/dev/null 2>&1 &
+}
+
+sup_log() {
+    printf '%(%F %T)T %s\n' -1 "$*"
+}
+
+sup_write_status() {
+    printf '%s\n' \
+        "SUPERVISOR_PID=$$" \
+        "MIRROR_STATE=$MIRROR_STATE" \
+        "MIRROR_PID=$MIRROR_PID" \
+        "MIRROR_RESTARTS=$MIRROR_RESTARTS" \
+        "WALLPAPER_PID=$WALLPAPER_PID" \
+        "LIVE_STATE=$LIVE_STATE" \
+        "LIVE_PID=$LIVE_PID" \
+        "LIVE_SINCE=$LIVE_SINCE" \
+        "LIVE_RECONNECTS=$LIVE_RECONNECTS" \
+        "LIVE_KBPS=$LIVE_KBPS" \
+        "LIVE_ERROR=${LIVE_ERROR@Q}" \
+        "AUDIO_WATCH_PID=$AUDIO_WATCH_PID" \
+        "AUDIO_DESCRIPTION=${AUDIO_DESCRIPTION@Q}" \
+        "STATUS_TIME=$EPOCHSECONDS" >"$STATUS_FILE"
+}
+
+sup_reply() {
+    printf '%s %s\n' "$1" "$2" >"$REPLY_FILE"
+}
+
+sup_set_live() {
+    hyprctl eval "if YTWS then YTWS.set_live($1) end" >/dev/null 2>&1 || true
+}
+
+# Bytes the far end has acknowledged on PID's established TCP connections.
+# This is delivery, not buffering: it stops growing when the network does,
+# even while the recorder keeps filling its socket buffer. (/proc/PID/io
+# would miss it entirely: ffmpeg sends with send(2), which wchar does not
+# count.)
+socket_acked() {
+    # Locals are prefixed: printf -v below assigns through the caller's name,
+    # and a local of the same name would capture the result.
+    local _sa_pid="$1" _sa_line _sa_mine=0 _sa_total=0 _sa_found=1 _sa_value
+    while IFS= read -r _sa_line; do
+        if [[ "$_sa_line" != [[:space:]]* ]]; then
+            _sa_mine=0
+            [[ "$_sa_line" == *"pid=$_sa_pid,"* ]] && _sa_mine=1
+        elif (( _sa_mine )) && [[ "$_sa_line" == *bytes_acked:* ]]; then
+            _sa_value="${_sa_line#*bytes_acked:}"
+            _sa_value="${_sa_value%% *}"
+            if [[ "$_sa_value" =~ ^[0-9]+$ ]]; then
+                _sa_total=$((_sa_total + _sa_value))
+                _sa_found=0
+            fi
+        fi
+    done < <(ss -Htinp state established 2>/dev/null)
+    printf -v "$2" '%s' "$_sa_total"
+    return "$_sa_found"
+}
+
+# The executable name of the session's preview client.
+preview_name() {
+    local command="${PREVIEW_COMMAND:-wl-mirror}"
+    printf '%s' "${command##*/}"
+}
+
+sup_mirror_start() {
+    if [[ "$(preview_name)" == wl-mirror ]]; then
+        "${PREVIEW_COMMAND:-wl-mirror}" --backend "$MIRROR_BACKEND" --show-cursor --scaling fit \
+            --title "$PREVIEW_TITLE" "$OUTPUT" </dev/null >>"$LOG_DIR/preview.log" 2>&1 &
+    else
+        "$PREVIEW_COMMAND" --title "$PREVIEW_TITLE" "$OUTPUT" </dev/null >>"$LOG_DIR/preview.log" 2>&1 &
+    fi
+    MIRROR_PID=$!
+    MIRROR_STATE=up
+    sup_log "preview started (pid $MIRROR_PID)"
+}
+
+sup_mirror_check() {
+    [[ "$MIRROR_STATE" == up ]] || return 0
+    pid_is_alive "$MIRROR_PID" && return 0
+    local status=0 t
+    wait "$MIRROR_PID" 2>/dev/null || status=$?
+    sup_log "preview exited with status $status"
+    local -a recent=()
+    for t in "${MIRROR_FAILURES[@]}" "$EPOCHSECONDS"; do
+        (( EPOCHSECONDS - t < 60 )) && recent+=("$t")
+    done
+    MIRROR_FAILURES=("${recent[@]}")
+    if (( ${#MIRROR_FAILURES[@]} > MIRROR_RESTART_LIMIT )); then
+        MIRROR_STATE=failed
+        MIRROR_PID=""
+        notify_user -u critical "Stream preview keeps failing" \
+            "The stream itself is unaffected. See $LOG_DIR/preview.log."
+        return 0
+    fi
+    MIRROR_RESTARTS=$((MIRROR_RESTARTS + 1))
+    sup_mirror_start
+}
+
+# wf-recorder prints the URL it publishes to; keep the key out of the log.
+sup_redact() {
+    local line
+    while IFS= read -r line; do
+        printf '%(%F %T)T %s\n' -1 "${line//"$SUP_KEY"/<stream key>}"
+    done
+}
+
+sup_live_attempt() {
+    wf_recorder_args
+    "${RECORDER:-wf-recorder}" "${WF_ARGS[@]}" -f "${YOUTUBE_RTMPS_URL%/}/$SUP_KEY" </dev/null \
+        > >(sup_redact >>"$LOG_DIR/live.log") 2>&1 &
+    LIVE_PID=$!
+    LIVE_ATTEMPT_AT=$EPOCHSECONDS
+    LIVE_PROGRESS_AT=$EPOCHSECONDS
+    LIVE_CONNECTED_AT=""
+    LIVE_ACKED=0
+    LIVE_SAMPLE_US=${EPOCHREALTIME/./}
+    LIVE_UNMUTED=0
+    LIVE_ESTABLISHED=0
+    [[ "$LIVE_STATE" == reconnecting ]] || LIVE_STATE=connecting
+    sup_log "connecting to YouTube (pid $LIVE_PID)"
+}
+
+# Default-device changes, as "audio" commands on the control FIFO.
+sup_audio_events() {
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+        *" on server "*|*"'new' on sink #"*|*"'remove' on sink #"*|*"'new' on source #"*|*"'remove' on source #"*)
+            printf '0 audio\n'
+            ;;
+        esac
+    done
+}
+
+# While viewers can hear the mix, keep it fed and follow the default devices.
+sup_audio_on() {
+    audio_link_sync
+    sup_log "stream audio: $AUDIO_DESCRIPTION"
+    pid_is_alive "$AUDIO_WATCH_PID" && return 0
+    pactl subscribe </dev/null 2>/dev/null > >(sup_audio_events >&"$SUP_CTL") &
+    AUDIO_WATCH_PID=$!
+}
+
+sup_audio_off() {
+    [[ -n "$AUDIO_WATCH_PID" ]] && kill "$AUDIO_WATCH_PID" 2>/dev/null
+    AUDIO_WATCH_PID=""
+    audio_unlink_all
+    AUDIO_DESCRIPTION=""
+}
+
+sup_live_give_up() {
+    sup_log "giving up: $1"
+    sup_audio_off
+    LIVE_WANTED=0
+    LIVE_STATE=failed
+    LIVE_ERROR="$1"
+    LIVE_KBPS=0
+    SUP_KEY=""
+    sup_set_live false
+    notify_user -u critical "Not live on YouTube" "$1"
+}
+
+sup_live_ended() {
+    sup_log "$1"
+    LIVE_PID=""
+    LIVE_KBPS=0
+    (( LIVE_WANTED )) || { LIVE_STATE=offline; return 0; }
+    if (( LIVE_ESTABLISHED )); then
+        LIVE_FAILURES=0
+    else
+        LIVE_FAILURES=$((LIVE_FAILURES + 1))
+        if (( LIVE_FAILURES >= LIVE_REFUSED_LIMIT )); then
+            sup_live_give_up "YouTube did not accept the stream $LIVE_FAILURES times in a row; check the stream key and that a broadcast is waiting for it"
+            return 0
+        fi
+    fi
+    if [[ "$LIVE_STATE" == live ]]; then
+        LIVE_RECONNECTS=$((LIVE_RECONNECTS + 1))
+        notify_user -u critical "Stream connection lost" "Reconnecting to YouTube..."
+    fi
+    LIVE_ERROR="$1"
+    LIVE_STATE=reconnecting
+    local delay=$((1 << (LIVE_FAILURES < 3 ? LIVE_FAILURES : 3)))
+    LIVE_RETRY_AT=$((EPOCHSECONDS + delay))
+}
+
+# wf-recorder finishes the stream cleanly on TERM as on INT, and TERM, unlike
+# INT, is not ignored by processes a script starts in the background.
+sup_live_kill() {
+    local pid="$1" status=0
+    kill -TERM "$pid" 2>/dev/null || return 0
+    for _ in {1..50}; do
+        pid_is_alive "$pid" || break
+        sup_sleep 0.1
+    done
+    pid_is_alive "$pid" && kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null || status=$?
+    return 0
+}
+
+sup_live_check() {
+    (( LIVE_WANTED )) || return 0
+    if [[ -z "$LIVE_PID" ]]; then
+        (( EPOCHSECONDS >= LIVE_RETRY_AT )) && sup_live_attempt
+        return 0
+    fi
+    if ! pid_is_alive "$LIVE_PID"; then
+        local status=0
+        wait "$LIVE_PID" 2>/dev/null || status=$?
+        sup_live_ended "wf-recorder exited with status $status"
+        return 0
+    fi
+
+    local acked=$LIVE_ACKED now=$EPOCHSECONDS now_us=${EPOCHREALTIME/./}
+    socket_acked "$LIVE_PID" acked || acked=$LIVE_ACKED
+    (( acked >= LIVE_ACKED )) || LIVE_ACKED=0 # a new connection inside the same recorder
+    if (( now_us - LIVE_SAMPLE_US >= 1000000 )); then
+        local kbps=$(( (acked - LIVE_ACKED) * 8000 / (now_us - LIVE_SAMPLE_US) ))
+        LIVE_KBPS=$(( LIVE_KBPS > 0 ? (LIVE_KBPS * 3 + kbps) / 4 : kbps ))
+        (( acked > LIVE_ACKED )) && LIVE_PROGRESS_AT=$now
+        LIVE_ACKED=$acked
+        LIVE_SAMPLE_US=$now_us
+    fi
+
+    if (( !LIVE_UNMUTED && now - LIVE_ATTEMPT_AT >= 1 )); then
+        unmute_capture "$LIVE_PID" && LIVE_UNMUTED=1
+    fi
+
+    if [[ -z "$LIVE_CONNECTED_AT" ]] && (( acked >= LIVE_CONNECTED_BYTES )); then
+        LIVE_CONNECTED_AT=$now
+        if [[ "$LIVE_STATE" == reconnecting ]]; then
+            notify_user "Reconnected to YouTube" "The stream is live again."
+        else
+            notify_user "You are live on YouTube"
+        fi
+        LIVE_STATE=live
+        LIVE_SINCE=${LIVE_SINCE:-$now}
+        LIVE_ERROR=""
+        sup_log "live"
+    fi
+    if [[ -n "$LIVE_CONNECTED_AT" ]] && (( !LIVE_ESTABLISHED && now - LIVE_CONNECTED_AT >= LIVE_ESTABLISHED_SECONDS )); then
+        LIVE_ESTABLISHED=1
+        LIVE_FAILURES=0
+    fi
+
+    if [[ -n "$LIVE_CONNECTED_AT" ]] && (( now - LIVE_PROGRESS_AT >= LIVE_STALL_SECONDS )); then
+        sup_live_kill "$LIVE_PID"
+        sup_live_ended "the connection stalled: nothing delivered for ${LIVE_STALL_SECONDS}s"
+    elif [[ -z "$LIVE_CONNECTED_AT" ]] && (( now - LIVE_ATTEMPT_AT >= LIVE_CONNECT_SECONDS )); then
+        sup_live_kill "$LIVE_PID"
+        sup_live_ended "could not connect to YouTube within ${LIVE_CONNECT_SECONDS}s"
+    fi
+}
+
+sup_live_stop() {
+    LIVE_WANTED=0
+    if [[ -n "$LIVE_PID" ]]; then
+        sup_live_kill "$LIVE_PID"
+        sup_log "stopped live delivery"
+    fi
+    sup_audio_off
+    LIVE_PID=""
+    LIVE_STATE=offline
+    LIVE_KBPS=0
+    SUP_KEY=""
+    sup_set_live false
+}
+
+sup_command() {
+    local seq cmd arg
+    read -r seq cmd arg <<<"$1"
+    case "$cmd" in
+    ping)
+        sup_reply "$seq" ok
+        ;;
+    live)
+        if (( LIVE_WANTED )); then
+            sup_reply "$seq" "error: already $LIVE_STATE"
+            return 0
+        fi
+        if [[ ! "$arg" =~ ^[A-Za-z0-9_-]{4,128}$ ]]; then
+            sup_reply "$seq" "error: that does not look like a YouTube stream key"
+            return 0
+        fi
+        SUP_KEY="$arg"
+        LIVE_WANTED=1 LIVE_FAILURES=0 LIVE_RECONNECTS=0 LIVE_SINCE="" LIVE_ERROR="" LIVE_KBPS=0
+        LIVE_STATE=connecting
+        sup_set_live true
+        sup_audio_on
+        sup_live_attempt
+        sup_reply "$seq" ok
+        ;;
+    audio)
+        if (( LIVE_WANTED )); then
+            audio_link_sync
+            sup_log "stream audio: $AUDIO_DESCRIPTION"
+        fi
+        ;;
+    offline)
+        sup_live_stop
+        sup_reply "$seq" ok
+        ;;
+    *)
+        sup_reply "$seq" "error: unknown command"
+        ;;
+    esac
+}
+
+supervise_session() {
+    # A long-lived process must not die on one failed command: every failure
+    # below is handled where it happens, so errexit would only turn a hiccup
+    # into a dropped stream.
+    set +e +o pipefail
+    trap - ERR
     load_state
-    output_exists || die "stream output is missing"
-    local assigned_monitor
-    assigned_monitor="$(
-        hyprctl -j workspaces | jq -r --argjson workspace "$WORKSPACE" \
-            '.[] | select(.id == $workspace) | .monitor'
-    )"
-    if [[ -n "$assigned_monitor" && "$assigned_monitor" != "$OUTPUT" ]]; then
-        hyprctl dispatch moveworkspacetomonitor \
-            "$WORKSPACE $OUTPUT" >/dev/null
-    fi
-    local current_physical_workspace
-    current_physical_workspace="$(
-        hyprctl -j monitors | jq -r --arg monitor "$ORIGINAL_MONITOR" \
-            '.[] | select(.name == $monitor) | .activeWorkspace.id'
-    )"
-    if [[ "$current_physical_workspace" =~ ^[1-9][0-9]*$ &&
-          "$current_physical_workspace" != "$VIEWER_WORKSPACE" ]]; then
-        RETURN_WORKSPACE="$current_physical_workspace"
-        write_state
-    fi
+    exec </dev/null
+    exec {SUP_SLEEP}<> <(:)
+    MIRROR_STATE=stopped MIRROR_PID="" MIRROR_RESTARTS=0 MIRROR_FAILURES=() WALLPAPER_PID=""
+    LIVE_STATE=offline LIVE_PID="" LIVE_SINCE="" LIVE_RECONNECTS=0 LIVE_KBPS=0 LIVE_ERROR=""
+    LIVE_WANTED=0 LIVE_FAILURES=0 LIVE_RETRY_AT=0 SUP_KEY=""
+    AUDIO_WATCH_PID="" AUDIO_DESCRIPTION=""
+    : >"$LOG_DIR/live.log"
 
-    hyprctl dispatch focusmonitor "$ORIGINAL_MONITOR" >/dev/null
-    hyprctl dispatch workspace "$VIEWER_WORKSPACE" >/dev/null
-    if pid_is_alive "$MIRROR_PID"; then
-        hyprctl dispatch focuswindow "pid:$MIRROR_PID" >/dev/null
+    rm -f "$CONTROL_FIFO"
+    mkfifo -m 600 "$CONTROL_FIFO"
+    exec {SUP_CTL}<>"$CONTROL_FIFO"
+    SUP_RUNNING=1
+    trap 'SUP_RUNNING=0' TERM INT HUP
+    local socket="${XDG_RUNTIME_DIR:-}/hypr/${HYPRLAND_INSTANCE_SIGNATURE:-}/.socket.sock"
+
+    if command -v swaybg >/dev/null 2>&1 && [[ -f "$WALLPAPER" ]]; then
+        swaybg -o "$OUTPUT" -i "$WALLPAPER" </dev/null >"$LOG_DIR/swaybg.log" 2>&1 &
+        WALLPAPER_PID=$!
     fi
-    focus_monitor_center "$OUTPUT"
-    hyprctl dispatch workspace "$WORKSPACE" >/dev/null
-    local stream_window
-    stream_window="$(
-        hyprctl -j clients | jq -r --argjson workspace "$WORKSPACE" \
-            '[.[] | select(.workspace.id == $workspace and .mapped)]
-             | sort_by(.focusHistoryID)
-             | .[0].address // empty'
-    )"
-    if [[ -n "$stream_window" ]]; then
-        hyprctl dispatch focuswindow "address:$stream_window" >/dev/null
-    fi
-    note "input is now controlling workspace $WORKSPACE on $OUTPUT"
+    sup_mirror_start
+    sup_write_status
+    sup_log "supervising workspace $WORKSPACE on $OUTPUT"
+
+    local line phase
+    while (( SUP_RUNNING )); do
+        if read -r -t 1 -u "$SUP_CTL" line; then
+            sup_command "$line"
+        fi
+        (( SUP_RUNNING )) || break
+        if [[ ! -S "$socket" ]]; then
+            sup_log "Hyprland has gone away"
+            break
+        fi
+        phase=""
+        read -r phase 2>/dev/null <"$PHASE_FILE" || true
+        if [[ "$phase" == lost ]] && (( LIVE_WANTED )); then
+            sup_live_stop
+            sup_live_give_up "the stream output disappeared"
+        fi
+        sup_mirror_check
+        sup_live_check
+        sup_write_status
+    done
+
+    sup_live_stop
+    MIRROR_STATE=stopped
+    [[ -n "$MIRROR_PID" ]] && kill "$MIRROR_PID" 2>/dev/null
+    [[ -n "$WALLPAPER_PID" ]] && kill "$WALLPAPER_PID" 2>/dev/null
+    wait 2>/dev/null
+    MIRROR_PID="" WALLPAPER_PID=""
+    LIVE_STATE=offline
+    sup_write_status
+    rm -f "$CONTROL_FIFO"
+    sup_log "supervisor stopped"
 }
 
-leave_stream() {
-    load_state
-    focus_monitor_center "$ORIGINAL_MONITOR"
-    if [[ "${RETURN_WORKSPACE:-}" =~ ^[1-9][0-9]*$ ]]; then
-        hyprctl dispatch workspace "$RETURN_WORKSPACE" >/dev/null
-    fi
-    note "input returned to $ORIGINAL_MONITOR"
+# --- input handoff and curtain ----------------------------------------------
+
+module_action() {
+    local code="$1"
+    hyprctl eval "if YTWS then $code end" >/dev/null
 }
 
 switch_workspace() {
     local selector="${1:?missing workspace selector}"
-    if [[ -r "$STATE_FILE" ]]; then
-        load_state
-        if [[ "$selector" =~ ^[1-9][0-9]*$ &&
-              "$selector" == "$WORKSPACE" ]]; then
-            enter_stream
-            return
-        fi
-
-        local focused_monitor
-        focused_monitor="$(
-            hyprctl -j monitors | jq -r '.[] | select(.focused) | .name'
-        )"
-        if [[ "$focused_monitor" == "$OUTPUT" ]]; then
-            leave_stream
-        else
-            hyprctl dispatch focusmonitor "$ORIGINAL_MONITOR" >/dev/null
-        fi
-    fi
-    hyprctl dispatch workspace "$selector" >/dev/null
+    [[ "$selector" =~ ^[A-Za-z0-9:+~_.-]+$ ]] || die "unsupported workspace selector: $selector"
+    local q
+    q="$(lua_quote "$selector")"
+    # One round trip: the module's safe switch when it is loaded, a plain
+    # dispatch otherwise.
+    hyprctl eval "if YTWS then YTWS.workspace($q) else hl.dispatch(hl.dsp.focus({ workspace = $q })) end" >/dev/null
 }
+
+set_curtain() {
+    local want
+    case "${1:-}" in
+    on) want=true ;;
+    off) want=false ;;
+    "") want=nil ;;
+    *) die "curtain takes 'on', 'off', or nothing to toggle" ;;
+    esac
+    load_state
+    ensure_module
+    local result
+    result="$(hypr_call "return YTWS.curtain($want)")"
+    [[ "$(json_field "$result" ok)" == true ]] || die "the curtain did not change: $result"
+    if [[ "$(json_field "$result" curtain)" == true ]]; then
+        note "curtain up: viewers see the curtain and hear nothing"
+    else
+        note "curtain down: viewers see workspace $WORKSPACE"
+    fi
+}
+
+# --- validation, live, status -----------------------------------------------
 
 test_file() {
     local file="$1"
@@ -521,8 +1285,10 @@ test_file() {
     video_ok="$(
         printf '%s\n' "$probe" | jq -r --argjson width "$WIDTH" \
             --argjson height "$HEIGHT" \
+            --arg rate "$FPS/1" \
             '[.streams[] | select(.codec_type == "video" and
-              .codec_name == "h264" and .width == $width and .height == $height)]
+              .codec_name == "h264" and .width == $width and .height == $height and
+              .r_frame_rate == $rate)]
              | length'
     )"
     audio_ok="$(
@@ -547,17 +1313,26 @@ test_file() {
 run_local_rtmp_test() {
     validate_config
     load_state
-    require_commands ffmpeg ffprobe timeout
-    pid_is_alive "$MIRROR_PID" || die "wl-mirror is not running"
+    load_status
+    require_commands ffmpeg ffprobe pw-link pw-play
+    case "${LIVE_STATE:-offline}" in
+    offline|failed) ;;
+    *) die "YouTube delivery is $LIVE_STATE; stop it before a local test" ;;
+    esac
     output_exists || die "stream output is missing"
 
     local seconds="${1:-5}"
-    [[ "$seconds" =~ ^[1-9][0-9]*$ ]] || die "test duration must be whole seconds"
-    local received="/tmp/yt-stream-workspace-test-$(date +%Y%m%d-%H%M%S).flv"
+    if [[ ! "$seconds" =~ ^[1-9][0-9]*$ ]] || (( seconds < 2 )); then
+        die "test duration must be at least 2 whole seconds"
+    fi
+    local received
+    received="/tmp/yt-stream-workspace-test-$(date +%Y%m%d-%H%M%S).flv"
     local url="rtmp://127.0.0.1:$TEST_RTMP_PORT/live/test"
-    local receiver_log="$STATE_DIR/rtmp-receiver.log"
-    local sender_log="$STATE_DIR/rtmp-sender.log"
-    local receiver_pid tone_pid attempt status
+    mkdir -p "$LOG_DIR"
+    chmod 700 "$LOG_DIR"
+    local receiver_log="$LOG_DIR/rtmp-receiver.log"
+    local sender_log="$LOG_DIR/rtmp-sender.log"
+    local receiver_pid tone_pid sender_pid status
 
     port_is_listening "$TEST_RTMP_PORT" &&
         die "TCP port $TEST_RTMP_PORT is already in use"
@@ -567,26 +1342,38 @@ run_local_rtmp_test() {
     receiver_pid=$!
     wait_until "local RTMP receiver" port_is_listening "$TEST_RTMP_PORT"
 
+    # A tone straight into the mix, through PipeWire itself as the recorder
+    # reads it: the test then costs what a live stream costs.
+    local tone="$RUN_DIR/test-tone.wav"
     ffmpeg -hide_banner -loglevel error -f lavfi \
         -i "sine=frequency=880:sample_rate=48000:duration=$seconds" \
-        -af volume=0.08 -f pulse -device "$MIX_SINK" \
-        yt-stream-workspace-test-tone >/dev/null 2>&1 &
+        -af volume=0.08 -ac 2 -y "$tone" || die "could not generate the test tone"
+    pw-play --target "$MIX_SINK" "$tone" >/dev/null 2>&1 &
     tone_pid=$!
 
+    audio_link_sync
+    trap audio_unlink_all EXIT
+    note "stream audio: $AUDIO_DESCRIPTION"
+
     wf_recorder_args
-    set +e
-    timeout --signal=INT --kill-after=3 "${seconds}s" \
-        wf-recorder "${WF_ARGS[@]}" -f "$url" \
-        >"$sender_log" 2>&1
-    status=$?
-    set -e
-    [[ "$status" == 0 || "$status" == 124 ]] || {
+    "${RECORDER:-wf-recorder}" "${WF_ARGS[@]}" -f "$url" >"$sender_log" 2>&1 &
+    sender_pid=$!
+    sleep 1
+    unmute_capture "$sender_pid" || true
+    sleep "$((seconds - 1))"
+    kill -TERM "$sender_pid" 2>/dev/null || true
+    status=0
+    wait "$sender_pid" || status=$?
+    (( status == 0 || status == 143 )) || {
         kill "$receiver_pid" "$tone_pid" 2>/dev/null || true
         die "wf-recorder failed; see $sender_log"
     }
     wait "$tone_pid" 2>/dev/null || true
+    rm -f "$tone"
+    audio_unlink_all
+    trap - EXIT
 
-    for attempt in $(seq 1 50); do
+    for _ in $(seq 1 50); do
         pid_is_alive "$receiver_pid" || break
         sleep 0.1
     done
@@ -600,58 +1387,182 @@ run_local_rtmp_test() {
     note "local RTMP test passed: $received"
 }
 
+# Print the stream key from YTWS_STREAM_KEY_COMMAND, YTWS_STREAM_KEY_FILE, or a
+# prompt, in that order.
+read_stream_key() {
+    local key="" mode
+    if [[ -n "$STREAM_KEY_COMMAND" ]]; then
+        IFS= read -r key < <(bash -c "$STREAM_KEY_COMMAND") ||
+            [[ -n "$key" ]] || die "YTWS_STREAM_KEY_COMMAND printed nothing"
+    elif [[ -n "$STREAM_KEY_FILE" ]]; then
+        [[ -r "$STREAM_KEY_FILE" ]] || die "cannot read YTWS_STREAM_KEY_FILE: $STREAM_KEY_FILE"
+        mode="$(stat -c %a "$STREAM_KEY_FILE")"
+        (( (8#$mode & 8#077) == 0 )) ||
+            die "$STREAM_KEY_FILE is readable by others; run: chmod 600 $STREAM_KEY_FILE"
+        IFS= read -r key <"$STREAM_KEY_FILE" || [[ -n "$key" ]] || die "$STREAM_KEY_FILE is empty"
+    else
+        [[ -t 0 ]] ||
+            die "no terminal to ask for the stream key; set YTWS_STREAM_KEY_COMMAND or YTWS_STREAM_KEY_FILE"
+        read -r -s -p "YouTube stream key: " key
+        printf '\n' >&2
+    fi
+    key="${key//[[:space:]]/}"
+    [[ "$key" =~ ^[A-Za-z0-9_-]{4,128}$ ]] || die "that does not look like a YouTube stream key"
+    printf '%s' "$key"
+}
+
+format_duration() {
+    local s=$1
+    if (( s >= 3600 )); then
+        printf '%d:%02d:%02d' $((s / 3600)) $((s % 3600 / 60)) $((s % 60))
+    else
+        printf '%d:%02d' $((s / 60)) $((s % 60))
+    fi
+}
+
 start_live() {
     validate_config
     load_state
-    pid_is_alive "${LIVE_PID:-}" && die "YouTube delivery is already running"
-    [[ -t 0 ]] || die "live mode needs an interactive terminal for the stream key"
+    load_status
+    ensure_module
+    supervisor_alive || die "the session supervisor is not running; run 'workspace-stream stop' and start again"
+    case "${LIVE_STATE:-offline}" in
+    offline|failed) ;;
+    *) die "YouTube delivery is already $LIVE_STATE" ;;
+    esac
+    phase_is active || die "the stream workspace is not isolated; run 'workspace-stream status'"
+    local host="${YOUTUBE_RTMPS_URL#*://}"
+    host="${host%%[/:]*}"
+    getent hosts "$host" >/dev/null || die "cannot resolve $host; check the network connection"
 
-    local key url
-    read -r -s -p "YouTube stream key: " key
-    printf '\n'
-    [[ -n "$key" ]] || die "stream key cannot be empty"
-    url="${YOUTUBE_RTMPS_URL%/}/$key"
-
-    wf_recorder_args
-    wf-recorder "${WF_ARGS[@]}" -f "$url" >/dev/null 2>&1 &
-    LIVE_PID=$!
-    unset key url
-    write_state
-
-    sleep 2
-    if ! pid_is_alive "$LIVE_PID"; then
-        LIVE_PID=""
-        write_state
-        die "wf-recorder exited before establishing the stream"
-    fi
-    note "YouTube delivery is running as PID $LIVE_PID"
+    local key
+    key="$(read_stream_key)"
+    supervisor_send live "$key" || die "could not go live: ${SUPERVISOR_REPLY#error: }"
+    unset key
+    note "connecting to YouTube..."
+    for _ in $(seq 1 120); do
+        load_status
+        case "$LIVE_STATE" in
+        live)
+            note "live on YouTube; delivery reconnects by itself if the network drops"
+            return 0
+            ;;
+        failed)
+            die "not live: $LIVE_ERROR"
+            ;;
+        esac
+        sleep 0.25
+    done
+    note "still connecting (${LIVE_ERROR:-no data sent yet}); 'workspace-stream status' shows progress"
 }
 
 stop_live() {
     load_state
-    stop_live_internal
-    write_state
-    note "YouTube delivery stopped; isolated workspace remains available"
+    supervisor_send offline || die "could not stop delivery: $SUPERVISOR_REPLY"
+    note "YouTube delivery stopped; the isolated workspace remains available"
+}
+
+describe_live() {
+    local now=$EPOCHSECONDS
+    case "${LIVE_STATE:-offline}" in
+    live)
+        printf 'live for %s at %s.%s Mbit/s' "$(format_duration $((now - ${LIVE_SINCE:-$now})))" \
+            $((LIVE_KBPS / 1000)) $((LIVE_KBPS % 1000 / 100))
+        (( LIVE_RECONNECTS == 0 )) || printf ', %s reconnect(s)' "$LIVE_RECONNECTS"
+        ;;
+    connecting) printf 'connecting' ;;
+    reconnecting) printf 'reconnecting (%s)' "${LIVE_ERROR:-connection lost}" ;;
+    failed) printf 'not live: %s' "$LIVE_ERROR" ;;
+    *) printf 'offline' ;;
+    esac
 }
 
 show_status() {
+    local json=0
+    [[ "${1:-}" == --json ]] && json=1
     if [[ ! -r "$STATE_FILE" ]]; then
-        note "not prepared"
+        if (( json )); then
+            printf '{"session":false}\n'
+        else
+            note "not prepared"
+        fi
         return
     fi
     load_state
-    printf 'workspace:      %s\n' "$WORKSPACE"
-    printf 'stream output:  %s\n' "$OUTPUT"
-    printf 'resolution:     %sx%s@%s scale %s\n' "$WIDTH" "$HEIGHT" "$FPS" "$SCALE"
+    load_status
+    local status="" supervisor=false
+    supervisor_alive && supervisor=true
+    if [[ "$(module_protocol)" == "$PROTOCOL" ]]; then
+        status="$(hypr_call 'return YTWS.status()' 2>/dev/null || true)"
+    fi
+    if (( json )); then
+        jq -n --argjson guard "${status:-null}" --argjson supervisor "$supervisor" \
+            --arg workspace "$WORKSPACE" --arg output "$OUTPUT" \
+            --arg live "${LIVE_STATE:-offline}" --arg since "${LIVE_SINCE:-}" \
+            --arg kbps "${LIVE_KBPS:-0}" --arg reconnects "${LIVE_RECONNECTS:-0}" \
+            --arg error "${LIVE_ERROR:-}" --arg preview "${MIRROR_STATE:-}" \
+            --arg desktop "${DESKTOP_AUDIO:-default}" --arg mic "${MIC:-default}" \
+            --arg linked "${AUDIO_DESCRIPTION:-}" \
+            --arg recorder "${RECORDER:-wf-recorder}" --argjson patched "$([[ "${RECORDER_PATCHED:-0}" == 1 ]] && echo true || echo false)" '
+            {session: true, workspace: ($workspace | tonumber), output: $output,
+             supervisor: $supervisor, preview: $preview,
+             live: {state: $live, since: ($since | if . == "" then null else tonumber end),
+                    kbps: ($kbps | tonumber), reconnects: ($reconnects | tonumber),
+                    error: (if $error == "" then null else $error end)},
+             audio: {desktop: $desktop, microphone: $mic,
+                     linked: (if $linked == "" then null else $linked end)},
+             recorder: {path: $recorder, patched: $patched},
+             guard: $guard}'
+        return
+    fi
+    printf 'workspace:      %s on %s (%sx%s@%s scale %s)\n' \
+        "$WORKSPACE" "$OUTPUT" "$WIDTH" "$HEIGHT" "$FPS" "$SCALE"
+    printf 'YouTube:        %s\n' "$(describe_live)"
+    if [[ -n "${AUDIO_DESCRIPTION:-}" ]]; then
+        printf 'audio:          %s\n' "$AUDIO_DESCRIPTION"
+    else
+        printf 'audio:          nothing linked until live (desktop %s, microphone %s)\n' \
+            "${DESKTOP_AUDIO:-default}" "${MIC:-default}"
+    fi
+    if [[ -n "$status" ]]; then
+        jq -r --arg layers "^($STREAM_LAYERS)$" '
+            "guard:          \(.phase), \(.corrections) correction(s)" +
+                (if .last_correction then " (last: \(.last_correction))" else "" end),
+            "stream shows:   \(.showing // "nothing")" +
+                (if .curtain then " (curtain up)" else "" end),
+            "you are:        " + (if .entered then "working in the stream" else "on \(.preview_monitor)" end),
+            "on the output:  " + ((.layers // []) | map(. + (if test($layers) then "" else " (hidden)" end)) | join(", ")),
+            (if .errors > 0 then "module errors:  \(.errors) (last: \(.last_error))" else empty end)
+        ' <<<"$status"
+    else
+        printf 'guard:          not loaded in Hyprland\n'
+    fi
+    local preview="${MIRROR_STATE:-down}"
+    [[ "$preview" == up ]] && preview="up on $PREVIEW_ON"
+    (( ${MIRROR_RESTARTS:-0} == 0 )) || preview+=" (restarted ${MIRROR_RESTARTS}x)"
+    printf 'preview:        %s\n' "$preview"
+    printf 'supervisor:     %s\n' "$([[ "$supervisor" == true ]] && echo running || echo "not running; run 'workspace-stream stop'")"
     printf 'VAAPI device:   %s\n' "${VAAPI_DEVICE:-unknown}"
-    printf 'output status:  %s\n' "$(output_exists && echo up || echo down)"
-    printf 'wl-mirror:      %s\n' "$(pid_is_alive "$MIRROR_PID" && echo up || echo down)"
-    printf 'mixed audio:    %s\n' "$(
-        pactl list short sinks | awk -v name="$MIX_SINK" \
-            '$2 == name {found=1} END {print found ? "up" : "down"}'
-    )"
-    printf 'YouTube:        %s\n' "$(pid_is_alive "${LIVE_PID:-}" && echo live || echo stopped)"
+    if [[ "${RECORDER_PATCHED:-0}" == 1 ]]; then
+        printf 'recorder:       %s (patched)\n' "$RECORDER"
+    else
+        printf 'recorder:       %s (stock: Hyprland redraws the stream for every frame)\n' \
+            "${RECORDER:-wf-recorder}"
+    fi
+    printf 'logs:           %s\n' "$LOG_DIR"
 }
+
+show_logs() {
+    printf '%s\n' "$LOG_DIR"
+    if [[ -d "$LOG_DIR" ]]; then
+        find "$LOG_DIR" -maxdepth 1 -type f -printf '%TY-%Tm-%Td %TH:%TM  %f\n' |
+            sort -r
+    else
+        note "no diagnostic logs have been written"
+    fi
+}
+
+# --- doctor -----------------------------------------------------------------
 
 doctor_check_command() {
     local command="$1"
@@ -680,12 +1591,38 @@ run_doctor() {
     printf 'yt-stream-workspace doctor\n'
     printf 'config: %s\n' "$CONFIG_FILE"
     printf 'target output: %s %sx%s@%s scale %s\n' "$OUTPUT" "$WIDTH" "$HEIGHT" "$FPS" "$SCALE"
+    printf 'mirror backend: %s\n' "$MIRROR_BACKEND"
+    printf 'logs: %s\n' "$LOG_DIR"
 
     local command
-    for command in hyprctl jq pactl wl-mirror wf-recorder ffmpeg ffprobe ss timeout; do
+    for command in hyprctl jq pactl pw-link ffmpeg ffprobe ss setsid getent; do
         doctor_check_command "$command"
     done
+    local preview
+    if preview="$(resolve_preview 2>/dev/null && printf '%s' "$PREVIEW_COMMAND")"; then
+        if [[ "${preview##*/}" == wl-mirror ]]; then
+            printf 'warn preview: %s redraws the whole preview every frame while shown; native/build.sh builds ytws-preview, which does not\n' "$preview"
+        else
+            printf 'ok   preview: %s\n' "$preview"
+        fi
+    else
+        printf 'miss preview: neither ytws-preview nor wl-mirror is installed; native/build.sh builds ytws-preview\n'
+        DOCTOR_FAILED=1
+    fi
+    local recorder
+    if recorder="$(resolve_recorder 2>/dev/null && printf '%s %s' "$RECORDER_PATCHED" "$RECORDER")"; then
+        if [[ "${recorder%% *}" == 1 ]]; then
+            printf 'ok   recorder: %s (patched)\n' "${recorder#* }"
+        else
+            printf 'warn recorder: %s is stock wf-recorder, which makes Hyprland redraw the stream for every frame; native/build.sh builds the patched one\n' \
+                "${recorder#* }"
+        fi
+    else
+        printf 'miss recorder: wf-recorder is not installed; native/build.sh builds it\n'
+        DOCTOR_FAILED=1
+    fi
     doctor_check_optional_command swaybg "only needed for virtual-output wallpaper"
+    doctor_check_optional_command notify-send "desktop notifications about live delivery"
     doctor_check_optional_command kitty "needed by self-test"
     doctor_check_optional_command wtype "needed by self-test"
 
@@ -698,6 +1635,32 @@ run_doctor() {
 
     if command -v hyprctl >/dev/null 2>&1 && hyprctl -j monitors >/dev/null 2>&1; then
         printf 'ok   hyprctl monitor query works\n'
+        local protocol
+        protocol="$(module_protocol)"
+        if [[ "$protocol" == "$PROTOCOL" ]]; then
+            printf 'ok   Hyprland has loaded the stream guard module\n'
+        elif [[ "$protocol" == 0 ]]; then
+            printf 'miss Hyprland has not loaded yt-stream-workspace.lua; add require("yt-stream-workspace") to hyprland.lua\n'
+            DOCTOR_FAILED=1
+        else
+            printf 'miss Hyprland runs module protocol %s, this command needs %s; run hyprctl reload\n' \
+                "$protocol" "$PROTOCOL"
+            DOCTOR_FAILED=1
+        fi
+        local bound
+        bound="$(
+            hyprctl -j workspacerules 2>/dev/null | jq -r '
+                .[] | select(.enabled != false and (.monitor // "") != "" and
+                             (.workspaceString | test("^[0-9]+$")))
+                | "\(.workspaceString) -> \(.monitor)"' 2>/dev/null || true
+        )"
+        if [[ -n "$bound" ]]; then
+            printf 'warn these workspaces are bound to monitors by your rules; stream another one:\n'
+            printf '       %s\n' "${bound//$'\n'/$'\n       '}"
+        fi
+        if [[ -n "$(hyprctl configerrors 2>/dev/null | tr -d '[:space:]')" ]]; then
+            printf 'warn Hyprland reports config errors; its error banner is drawn on the focused monitor, which can be the stream\n'
+        fi
     else
         printf 'miss hyprctl monitor query failed\n'
         DOCTOR_FAILED=1
@@ -719,11 +1682,27 @@ run_doctor() {
         fi
     fi
 
-    local snippet="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/yt-stream-workspace.conf"
-    if [[ -r "$snippet" ]]; then
-        printf 'ok   Hyprland snippet installed: %s\n' "$snippet"
+    if [[ -n "$STREAM_KEY_COMMAND" ]]; then
+        printf 'ok   stream key comes from YTWS_STREAM_KEY_COMMAND\n'
+    elif [[ -n "$STREAM_KEY_FILE" ]]; then
+        if [[ ! -r "$STREAM_KEY_FILE" ]]; then
+            printf 'miss YTWS_STREAM_KEY_FILE is not readable: %s\n' "$STREAM_KEY_FILE"
+            DOCTOR_FAILED=1
+        elif (( (8#$(stat -c %a "$STREAM_KEY_FILE") & 8#077) != 0 )); then
+            printf 'miss %s is readable by others; run: chmod 600 %s\n' "$STREAM_KEY_FILE" "$STREAM_KEY_FILE"
+            DOCTOR_FAILED=1
+        else
+            printf 'ok   stream key file: %s\n' "$STREAM_KEY_FILE"
+        fi
     else
-        printf 'warn Hyprland snippet not installed at %s\n' "$snippet"
+        printf 'ok   stream key is asked for on the terminal when going live\n'
+    fi
+
+    local module
+    if module="$(module_path)"; then
+        printf 'ok   Hyprland module file: %s\n' "$module"
+    else
+        printf 'warn yt-stream-workspace.lua not found next to hyprland.lua\n'
     fi
 
     if (( DOCTOR_FAILED )); then
@@ -732,6 +1711,8 @@ run_doctor() {
     fi
     printf '\nDoctor passed. Next useful check: workspace-stream self-test\n'
 }
+
+# --- self-test --------------------------------------------------------------
 
 self_test_window() {
     local marker="$1" key
@@ -746,67 +1727,109 @@ self_test_window() {
     done
 }
 
+focused_monitor() {
+    hypr_call 'return hl.get_active_monitor().name'
+}
+
+# Where every window is: address, workspace, fullscreen, hidden.
+window_placement() {
+    hyprctl -j clients | jq -r '.[] | "\(.address) \(.workspace.name) \(.fullscreen) \(.hidden) \(.class)"' | sort
+}
+
 run_self_test() {
     validate_config
-    require_commands hyprctl jq kitty wtype ffmpeg ffprobe timeout
+    require_commands hyprctl jq kitty wtype ffmpeg ffprobe setsid
     [[ ! -e "$STATE_FILE" ]] || die "stop the existing stream session before self-test"
+    ensure_module
 
     local test_workspace="${YTWS_SELF_TEST_WORKSPACE:-99}"
-    local marker="/tmp/yt-stream-workspace-input-$$"
+    local marker="$RUN_DIR.self-test-$$"
     local test_pid=""
-    local original_workspace
-    original_workspace="$(hyprctl -j activeworkspace | jq -r '.id')"
+    local original_workspace before
+    original_workspace="$(hypr_call 'return hl.get_active_workspace().id')"
+    # The test must leave your own windows exactly where they were.
+    before="$(window_placement)"
 
     cleanup_self_test() {
         if [[ -r "$STATE_FILE" ]]; then
             "$SELF" stop >/dev/null 2>&1 || true
         fi
-        pid_is_alive "${test_pid:-}" && kill "$test_pid" 2>/dev/null || true
+        stop_pid "${test_pid:-}" kitty
         [[ -n "${marker:-}" ]] && rm -f "$marker"
         if [[ -n "${original_workspace:-}" ]]; then
-            hyprctl dispatch workspace "$original_workspace" >/dev/null 2>&1 || true
+            hyprctl dispatch "hl.dsp.focus({ workspace = \"$original_workspace\" })" >/dev/null 2>&1 || true
         fi
     }
     trap cleanup_self_test EXIT
 
-    kitty --class yt-stream-workspace-test --title YT-Stream-Workspace-Test \
-        "$SELF" _self-test-window "$marker" >/dev/null 2>&1 &
-    test_pid=$!
-    wait_until "test window" client_pid_exists "$test_pid"
-    hyprctl dispatch movetoworkspacesilent \
-        "$test_workspace,pid:$test_pid" >/dev/null
-    wait_until "temporary workspace" workspace_exists "$test_workspace"
+    test_window_mapped() {
+        hyprctl -j clients | jq -e --argjson pid "$test_pid" 'any(.[]; .pid == $pid and .mapped)' >/dev/null
+    }
+    test_pid="$(
+        spawn_detached /dev/null kitty --class yt-stream-workspace-test \
+            --title YT-Stream-Workspace-Test "$SELF" _self-test-window "$marker"
+    )"
+    wait_until "test window" test_window_mapped
+    hyprctl dispatch "hl.dsp.window.move({ workspace = \"$test_workspace\", window = \"pid:$test_pid\", follow = false })" >/dev/null
 
     "$SELF" start "$test_workspace"
-    sleep 0.5
+    # The state file is private shell data written by this command.
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+    local status
+    status="$(hypr_call 'return YTWS.status()')"
+    [[ "$(json_field "$status" showing)" == "$test_workspace" ]] ||
+        die "the selected workspace is not active on the stream output"
+    jq -e --arg ws "$test_workspace" '(.workspaces_on_output - [$ws, "stream-curtain"]) == []' \
+        <<<"$status" >/dev/null || die "a private workspace is assigned to the stream output"
+    note "stream activation and private-workspace placement passed"
+
     "$SELF" enter
+    sleep 0.3
     wtype -s 200 v
     wait_until "keyboard input on the stream output" test -s "$marker"
     [[ "$(cat "$marker")" == "v" ]] || die "the stream workspace received the wrong key"
     note "mirrored display and direct keyboard control passed"
+
     "$SELF" leave
-    local expected_monitor
-    expected_monitor="$(source "$STATE_FILE"; printf '%s' "$ORIGINAL_MONITOR")"
-    [[ "$(
-        hyprctl -j monitors | jq -r '.[] | select(.focused) | .name'
-    )" == "$expected_monitor" ]] || die "leave did not restore physical input"
-    note "input return to $expected_monitor passed"
+    sleep 0.2
+    [[ "$(focused_monitor)" == "$PREVIEW_ON" ]] || die "leave did not restore physical input"
+    note "input return to $PREVIEW_ON passed"
 
     "$SELF" test 5
-    note "all automated integration checks passed"
     cleanup_self_test
     trap - EXIT
+    local after moved
+    after="$(window_placement)"
+    moved="$(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after"))"
+    if [[ -n "$moved" ]]; then
+        printf 'workspace-stream: before the test:  %s\n' "$moved" >&2
+        die "the self-test moved or changed windows it did not create"
+    fi
+    note "your own windows were left where they were"
+    note "all automated integration checks passed"
 }
+
+adopt_hyprland_instance
 
 case "${1:-}" in
 start)
     start_session "${2:-}"
     ;;
+stop)
+    stop_session
+    ;;
 enter)
-    enter_stream
+    module_action 'YTWS.enter()'
     ;;
 leave)
-    leave_stream
+    module_action 'YTWS.leave()'
+    ;;
+toggle)
+    module_action 'YTWS.toggle()'
+    ;;
+curtain)
+    set_curtain "${2:-}"
     ;;
 workspace)
     switch_workspace "${2:-}"
@@ -821,16 +1844,19 @@ stop-live)
     stop_live
     ;;
 status)
-    show_status
+    show_status "${2:-}"
+    ;;
+logs)
+    show_logs
     ;;
 doctor)
     run_doctor
     ;;
-stop)
-    stop_session
-    ;;
 self-test)
     run_self_test
+    ;;
+_supervise)
+    supervise_session
     ;;
 _self-test-window)
     self_test_window "${2:?missing marker path}"

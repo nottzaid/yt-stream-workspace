@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Kant <283011337+muradkant@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 19:55:55 +0300
+Subject: [PATCH 4/7] Wait for events instead of polling
+
+The capture thread checked for a free buffer every 0.5 ms and the
+encoder thread for a captured frame every 1 ms: two thousand wakeups a
+second whatever the frame rate, keeping a core out of its idle states
+for the whole recording. Block on a condition variable instead.
+
+The capture thread now waits on the compositor and an eventfd together,
+so a stop request (signal, write failure, lost audio) ends the recording
+at once even while no frame is coming, as happens with damage tracking
+on an unchanging output.
+---
+ src/buffer-pool.hpp | 37 +++++++++++++++++---
+ src/main.cpp        | 84 +++++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 107 insertions(+), 14 deletions(-)
+
+diff --git a/src/buffer-pool.hpp b/src/buffer-pool.hpp
+index f78e5df..cb6394a 100644
+--- a/src/buffer-pool.hpp
++++ b/src/buffer-pool.hpp
+@@ -3,6 +3,7 @@
+ #include <array>
+ #include <mutex>
+ #include <atomic>
++#include <condition_variable>
+ #include <type_traits>
+ 
+ class buffer_pool_buf
+@@ -64,11 +65,32 @@ public:
+         return *bufs[encode_idx];
+     }
+ 
++    // Block until the current capture buffer can take a new frame, or stop.
++    void wait_capture(const std::atomic<bool>& stop)
++    {
++        std::unique_lock<std::mutex> lock(mutex);
++        changed.wait(lock, [&] { return stop || bufs[capture_idx]->ready_capture(); });
++    }
++
++    // Block until the current encode buffer holds a frame, or stop.
++    void wait_encode(const std::atomic<bool>& stop)
++    {
++        std::unique_lock<std::mutex> lock(mutex);
++        changed.wait(lock, [&] { return stop || bufs[encode_idx]->ready_encode(); });
++    }
++
++    // Wake the waiters so they notice a stop request.
++    void wake()
++    {
++        { std::lock_guard<std::mutex> lock(mutex); }
++        changed.notify_all();
++    }
++
+     // Signal that the current capture buffer has been successfully obtained
+     // from the compositor and select the next buffer to capture in.
+     T& next_capture()
+     {
+-        std::lock_guard<std::mutex> lock(mutex);
++        std::unique_lock<std::mutex> lock(mutex);
+         bufs[capture_idx]->released = false;
+         bufs[capture_idx]->available = true;
+         size_t next = (capture_idx + 1) % bufs_size;
+@@ -84,22 +106,29 @@ public:
+             bufs[next] = new T;
+         }
+         capture_idx = next;
+-        return *bufs[capture_idx];
++        T& captured = *bufs[capture_idx];
++        lock.unlock();
++        changed.notify_all();
++        return captured;
+     }
+ 
+     // Signal that the encode buffer has been submitted for encoding
+     // and select the next buffer for encoding.
+     T& next_encode()
+     {
+-        std::lock_guard<std::mutex> lock(mutex);
++        std::unique_lock<std::mutex> lock(mutex);
+         bufs[encode_idx]->available = false;
+         bufs[encode_idx]->released = true;
+         encode_idx = (encode_idx + 1) % bufs_size;
+-        return *bufs[encode_idx];
++        T& encoding = *bufs[encode_idx];
++        lock.unlock();
++        changed.notify_all();
++        return encoding;
+     }
+ 
+ private:
+     std::mutex mutex;
++    std::condition_variable changed;
+     std::array<T*, N> bufs;
+     size_t bufs_size = 2;
+     size_t capture_idx = 0;
+diff --git a/src/main.cpp b/src/main.cpp
+index 70c24f6..bdefc3a 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -16,6 +16,8 @@
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <signal.h>
++#include <poll.h>
++#include <sys/eventfd.h>
+ #include <unistd.h>
+ #include <gbm.h>
+ #include <fcntl.h>
+@@ -199,15 +201,30 @@ struct wf_buffer : public buffer_pool_buf
+ std::atomic<bool> exit_main_loop{false};
+ static std::atomic<bool> exit_failure{false};
+ 
++/* Readable once exit is requested, so a wait on the compositor wakes up
++ * even when no frame is coming. */
++static int exit_fd = -1;
++
++buffer_pool<wf_buffer, 16> buffers;
++
++static void signal_exit()
++{
++    exit_main_loop = true;
++    if (exit_fd >= 0) {
++        uint64_t one = 1;
++        ssize_t written = write(exit_fd, &one, sizeof(one));
++        (void)written;
++    }
++}
++
+ void request_exit(bool failure)
+ {
+     if (failure)
+         exit_failure = true;
+-    exit_main_loop = true;
++    signal_exit();
++    buffers.wake();
+ }
+ 
+-buffer_pool<wf_buffer, 16> buffers;
+-
+ bool buffer_copy_done = false;
+ 
+ static int backingfile(off_t size)
+@@ -640,9 +657,7 @@ static void write_loop(FrameWriterParams params)
+     while(!exit_main_loop)
+     {
+         // wait for frame to become available
+-        while(buffers.encode().ready_encode() != true && !exit_main_loop) {
+-            std::this_thread::sleep_for(std::chrono::microseconds(1000));
+-        }
++        buffers.wait_encode(exit_main_loop);
+         if (exit_main_loop) {
+             break;
+         }
+@@ -750,7 +765,8 @@ static void write_loop(FrameWriterParams params)
+ 
+ void handle_graceful_termination(int)
+ {
+-    exit_main_loop = true;
++    /* Async-signal-safe: the main loop wakes the encoder thread. */
++    signal_exit();
+ }
+ 
+ static bool user_specified_overwrite(std::string filename)
+@@ -1097,6 +1113,46 @@ static void list_available_outputs()
+ }
+ 
+ 
++/* wl_display_dispatch(), but also returning once exit is requested. */
++static int dispatch_wayland()
++{
++    if (wl_display_prepare_read(display) == -1)
++        return wl_display_dispatch_pending(display);
++
++    struct pollfd fds[2] = {
++        { wl_display_get_fd(display), POLLIN, 0 },
++        { exit_fd, POLLIN, 0 },
++    };
++
++    while (wl_display_flush(display) == -1) {
++        if (errno != EAGAIN) {
++            wl_display_cancel_read(display);
++            return errno == EPIPE ? 0 : -1;
++        }
++        fds[0].events = POLLOUT;
++        if ((poll(fds, 2, -1) == -1 && errno != EINTR) || exit_main_loop) {
++            wl_display_cancel_read(display);
++            return -1;
++        }
++    }
++
++    fds[0].events = POLLIN;
++    while (poll(fds, 2, -1) == -1) {
++        if (errno != EINTR || exit_main_loop) {
++            wl_display_cancel_read(display);
++            return -1;
++        }
++    }
++    if (exit_main_loop || !(fds[0].revents & (POLLIN | POLLERR | POLLHUP))) {
++        wl_display_cancel_read(display);
++        return -1;
++    }
++
++    if (wl_display_read_events(display) == -1)
++        return -1;
++    return wl_display_dispatch_pending(display);
++}
++
+ int main(int argc, char *argv[])
+ {
+     FrameWriterParams params = FrameWriterParams(exit_main_loop);
+@@ -1393,6 +1449,12 @@ int main(int argc, char *argv[])
+     bool spawned_thread = false;
+     std::thread writer_thread;
+ 
++    exit_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++    if (exit_fd < 0) {
++        perror("eventfd");
++        return EXIT_FAILURE;
++    }
++
+     for (auto signo : GRACEFUL_TERMINATION_SIGNALS)
+     {
+         signal(signo, handle_graceful_termination);
+@@ -1401,14 +1463,15 @@ int main(int argc, char *argv[])
+     while(!exit_main_loop)
+     {
+         // wait for a free buffer
+-        while(buffers.capture().ready_capture() != true) {
+-            std::this_thread::sleep_for(std::chrono::microseconds(500));
++        buffers.wait_capture(exit_main_loop);
++        if (exit_main_loop) {
++            break;
+         }
+ 
+         buffer_copy_done = false;
+         request_next_frame();
+ 
+-        while (!buffer_copy_done && !exit_main_loop && wl_display_dispatch(display) != -1) {
++        while (!buffer_copy_done && !exit_main_loop && dispatch_wayland() != -1) {
+             // This space is intentionally left blank
+         }
+ 
+@@ -1432,6 +1495,7 @@ int main(int argc, char *argv[])
+         buffers.next_capture();
+     }
+ 
++    buffers.wake();
+     if (writer_thread.joinable())
+     {
+         writer_thread.join();
